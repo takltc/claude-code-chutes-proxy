@@ -23,6 +23,31 @@ Quickstart
  - `PROXY_BACKOFF_ON_429` (default on): For non-stream requests, honors small `Retry-After` and retries once.
  - Inspect discovered models: `GET /_schemas`.
 
+Quick Start Options
+
+### Option 1: Docker (Recommended)
+
+```bash
+# Clone and start via Docker Compose
+git clone <repository-url>
+cd claude-code-chutes-proxy
+docker compose up --build
+
+# The proxy will be available at http://localhost:8090
+```
+
+### Option 2: Local Python
+
+```bash
+# Install dependencies
+python -m ensurepip --upgrade
+python -m pip install -r requirements.txt
+
+# Set environment and run
+export CHUTES_BASE_URL=http://localhost:8000
+uvicorn app.main:app --host 0.0.0.0 --port 8090
+```
+
 Install
 
 ```
@@ -60,19 +85,72 @@ Body example:
 - Streaming emits Anthropic-style SSE events for text deltas. Token usage is reported at end when available from backend.
 - If your Chutes backend already exposes OpenAI-compatible endpoints (e.g. vLLM/SGLang templates), you can point `CHUTES_BASE_URL` directly to that service.
 
+Environment Configuration
+
+### Docker Compose with .env File
+
+Create a `.env` file in your project root:
+
+```env
+CHUTES_BASE_URL=http://your-chutes-backend:8000
+CHUTES_API_KEY=your-api-key-if-required
+MODEL_MAP={"claude-3.5-sonnet": "Qwen2-72B-Instruct", "claude-3-haiku": "Llama-3.1-8B-Instruct"}
+DEBUG_PROXY=1
+```
+
+Then uncomment the `env_file` line in `docker-compose.yml`:
+
+```yaml
+services:
+  proxy:
+    # ... existing config ...
+    env_file:
+      - .env
+```
+
+### Environment Variable Reference
+
+All environment variables with their defaults and descriptions:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHUTES_BASE_URL` | `https://llm.chutes.ai` | Chutes/OpenAI-compatible backend URL |
+| `CHUTES_API_KEY` | - | Optional API key for backend |
+| `CHUTES_AUTH_STYLE` | `both` | Auth forwarding: `header`, `env`, or `both` |
+| `MODEL_MAP` | `{}` | JSON string for model name mapping |
+| `TOOL_NAME_MAP` | `{}` | JSON string for tool name mapping |
+| `AUTO_FIX_MODEL_CASE` | `1` | Auto-correct model casing |
+| `DEBUG_PROXY` | `0` | Enable request/response logging |
+| `PROXY_BACKOFF_ON_429` | `1` | Retry on rate limiting |
+| `PROXY_MAX_RETRY_ON_429` | `1` | Max retry attempts for 429 |
+| `PROXY_MAX_RETRY_AFTER` | `2` | Max retry-after seconds |
+| `UVICORN_WORKERS` | `1` | Uvicorn worker processes |
+| `PORT` | `8080` | Internal container port |
+
 Docker
 
 - Build and run with Compose (recommended):
   - `docker compose up --build`
-  - Exposes `http://localhost:8090` → container `8090`.
-  - Configure env via your shell or a `.env` file. Common vars:
-    - `CHUTES_BASE_URL` (default `https://llm.chutes.ai`)
-    - `CHUTES_API_KEY` (optional)
-    - `MODEL_MAP`, `TOOL_NAME_MAP` (JSON strings)
-    - `AUTO_FIX_MODEL_CASE`, `DEBUG_PROXY`
+  - Exposes `http://localhost:8090` → container `8080` (mapped from host port 8090).
+  - Includes health checks with automatic restart
+  - Authoritative list of configurable environment variables:
+    - `CHUTES_BASE_URL` (default `https://llm.chutes.ai`) - Chutes/OpenAI backend URL
+    - `CHUTES_API_KEY` (optional) - Backend API key
+    - `CHUTES_AUTH_STYLE` (default `both`) - Auth forwarding behavior
+    - `MODEL_MAP` (default `{}`) - JSON string mapping Anthropic→backend model names
+    - `TOOL_NAME_MAP` (default `{}`) - JSON string mapping tool names
+    - `AUTO_FIX_MODEL_CASE` (default `1`) - Auto-correct model casing
+    - `DEBUG_PROXY` (default `0`) - Enable request/response logging
+    - `PROXY_BACKOFF_ON_429` (default `1`) - Retry on rate limiting
+    - `PROXY_MAX_RETRY_ON_429` (default `1`) - Max 429 retry attempts
+    - `PROXY_MAX_RETRY_AFTER` (default `2`) - Max retry-after seconds
+    - `UVICORN_WORKERS` (default `1`) - Number of Uvicorn workers
+    - `PORT` (default `8080`) - Internal container port
 - Manual Docker build/run:
   - Build: `docker build -t claude-chutes-proxy .`
-  - Run: `docker run --rm -p 8090:8090 -e CHUTES_BASE_URL=$CHUTES_BASE_URL claude-chutes-proxy`
+  - Run: `docker run --rm -p 8090:8080 -e CHUTES_BASE_URL=$CHUTES_BASE_URL claude-chutes-proxy`
+  - The container runs on port 8080 internally (exposed as 8090 on host)
+  - Includes health checks every 30 seconds
 
 Docker usage example
 
