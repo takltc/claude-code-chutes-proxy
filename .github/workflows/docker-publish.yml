@@ -14,7 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: takltc/claude-code-chutes-proxy
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -27,7 +27,7 @@ jobs:
 
       - name: Read version
         id: vars
-        run: echo "version=$(cat VERSION | tr -d "\n\r" | xargs)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(tr -d '\n\r' < VERSION | xargs)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
