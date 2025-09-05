@@ -44,7 +44,7 @@ python -m ensurepip --upgrade
 python -m pip install -r requirements.txt
 
 # Set environment and run
-export CHUTES_BASE_URL=http://localhost:8000
+export CHUTES_BASE_URL=https://llm.chutes.ai
 uvicorn app.main:app --host 0.0.0.0 --port 8090
 ```
 
@@ -58,7 +58,7 @@ python -m pip install -r requirements.txt
 Run
 
 ```
-export CHUTES_BASE_URL=http://localhost:8000
+export CHUTES_BASE_URL=https://llm.chutes.ai
 uvicorn app.main:app --host 0.0.0.0 --port 8090
 ```
 
