@@ -55,8 +55,7 @@ jobs:
 
           # Add 'latest' for default branch pushes
           if [ "${REF_TYPE}" = "branch" ] && [ "${REF_NAME}" = "${DEFAULT_BRANCH}" ]; then
-            TAGS="${TAGS}
-${IMG}:latest"
+            TAGS="${TAGS}\n${IMG}:latest"
           fi
 
           # Add tags for tag push or release
@@ -68,12 +67,10 @@ ${IMG}:latest"
           fi
 
           if [ -n "${tagname}" ]; then
-            TAGS="${TAGS}
-${IMG}:${tagname}"
+            TAGS="${TAGS}\n${IMG}:${tagname}"
             if printf '%s' "${tagname}" | grep -Eq '^v[0-9]'; then
               stripped="${tagname#v}"
-              TAGS="${TAGS}
-${IMG}:${stripped}"
+              TAGS="${TAGS}\n${IMG}:${stripped}"
             fi
           fi
 
