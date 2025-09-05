@@ -22,6 +22,7 @@ RUN python -m pip install --upgrade pip \
 # Copy source
 COPY app ./app
 COPY run.sh ./run.sh
+RUN chmod +x ./run.sh
 
 # Default environment (can be overridden at runtime)
 ENV PORT=8080 \
@@ -36,4 +37,3 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS "http://localh
 
 # Run via the provided launcher script
 CMD ["./run.sh"]
-

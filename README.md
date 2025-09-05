@@ -135,7 +135,53 @@ All environment variables with their defaults and descriptions:
 
 Docker
 
-- Build and run with Compose (recommended):
+- Prebuilt image (GHCR):
+  - Pull: `docker pull ghcr.io/takltc/claude-code-chutes-proxy:0.0.1`
+  - Also available: `:latest` tag tracking default branch builds
+  - Run:
+    ```bash
+    docker run --rm \
+      -p 8090:8080 \
+      -e CHUTES_BASE_URL=${CHUTES_BASE_URL:-https://llm.chutes.ai} \
+      -e CHUTES_API_KEY=${CHUTES_API_KEY:-} \
+      -e AUTO_FIX_MODEL_CASE=${AUTO_FIX_MODEL_CASE:-1} \
+      -e DEBUG_PROXY=${DEBUG_PROXY:-0} \
+      -e PROXY_BACKOFF_ON_429=${PROXY_BACKOFF_ON_429:-1} \
+      -e PROXY_MAX_RETRY_ON_429=${PROXY_MAX_RETRY_ON_429:-1} \
+      -e PROXY_MAX_RETRY_AFTER=${PROXY_MAX_RETRY_AFTER:-2} \
+      -e CHUTES_AUTH_STYLE=${CHUTES_AUTH_STYLE:-both} \
+      -e MODEL_MAP='${MODEL_MAP:-{}}' \
+      -e TOOL_NAME_MAP='${TOOL_NAME_MAP:-{}}' \
+      ghcr.io/takltc/claude-code-chutes-proxy:0.0.1
+    ```
+  - Docker Compose (use prebuilt image instead of building):
+    ```yaml
+    services:
+      proxy:
+        image: ghcr.io/takltc/claude-code-chutes-proxy:0.0.1
+        container_name: claude-chutes-proxy
+        environment:
+          - PORT=8080
+          - CHUTES_BASE_URL=${CHUTES_BASE_URL:-https://llm.chutes.ai}
+          - CHUTES_API_KEY=${CHUTES_API_KEY:-}
+          - AUTO_FIX_MODEL_CASE=${AUTO_FIX_MODEL_CASE:-1}
+          - DEBUG_PROXY=${DEBUG_PROXY:-0}
+          - PROXY_BACKOFF_ON_429=${PROXY_BACKOFF_ON_429:-1}
+          - PROXY_MAX_RETRY_ON_429=${PROXY_MAX_RETRY_ON_429:-1}
+          - PROXY_MAX_RETRY_AFTER=${PROXY_MAX_RETRY_AFTER:-2}
+          - CHUTES_AUTH_STYLE=${CHUTES_AUTH_STYLE:-both}
+          - MODEL_MAP=${MODEL_MAP:-{}}
+          - TOOL_NAME_MAP=${TOOL_NAME_MAP:-{}}
+        ports:
+          - "8090:8080"
+        healthcheck:
+          test: ["CMD-SHELL", "curl -fsS http://localhost:${PORT}/ || exit 1"]
+          interval: 30s
+          timeout: 5s
+          retries: 3
+        restart: unless-stopped
+    ```
+- Build and run with Compose (local dev):
   - `docker compose up --build`
   - Exposes `http://localhost:8090` → container `8080` (mapped from host port 8090).
   - Includes health checks with automatic restart
