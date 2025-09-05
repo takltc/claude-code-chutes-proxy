@@ -29,7 +29,7 @@ Quick Start Options
 
 ```bash
 # Clone and start via Docker Compose
-git clone <repository-url>
+git clone https://github.com/takltc/claude-code-chutes-proxy
 cd claude-code-chutes-proxy
 docker compose up --build
 
@@ -60,6 +60,12 @@ Run
 ```
 export CHUTES_BASE_URL=https://llm.chutes.ai
 uvicorn app.main:app --host 0.0.0.0 --port 8090
+```
+
+<b>Run with Claude Code</b>
+
+```
+ANTHROPIC_BASE_URL="http://localhost:8090" ANTHROPIC_API_KEY="your-chutes-api-key" ANTHROPIC_MODEL="moonshotai/Kimi-K2-Instruct-0905" ANTHROPIC_SMALL_FAST_MODEL="moonshotai/Kimi-K2-Instruct-0905" claude --dangerously-skip-permissions
 ```
 
 Usage (Anthropic-compatible)
