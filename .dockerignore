@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.swp
+*.DS_Store
+dist
+build
+node_modules
+tests
+WARP.md
+AGENTS.md
+
