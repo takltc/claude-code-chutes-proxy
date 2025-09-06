@@ -22,6 +22,7 @@ from .transform import (
     map_finish_reason,
     openai_to_anthropic_response,
     choose_tool_call_parser,
+    parse_mcp_tool_markup,
 )
 
 
@@ -426,6 +427,9 @@ async def messages(
 
                     # Rely solely on sglang parser when available
 
+                    # Buffer for Cloud Code MCP tool-call markup across stream chunks
+                    mcp_buf = ""
+
                     async for line in upstream.aiter_lines():
                         if not line:
                             continue
@@ -475,11 +479,86 @@ async def messages(
                                     ms = ensure_message_start()
                                     if ms:
                                         yield ms
-                                # Use sglang FunctionCallParser for textual tool calls when available
-                                normal_piece = piece
-                                if parser is not None:
+                                # Handle Cloud Code MCP tool-call markup robustly across stream chunks
+                                BEG = "<|tool_calls_section_begin|>"
+                                END = "<|tool_calls_section_end|>"
+                                # Buffer for potential split markup across deltas
+                                mcp_buf += piece  # type: ignore
+
+                                def _drain_mcp(buf: str):
+                                    out_text_parts: list[str] = []
+                                    calls: list[dict] = []
+                                    pos = 0
+                                    while True:
+                                        i = buf.find(BEG, pos)
+                                        if i == -1:
+                                            out_text_parts.append(buf[pos:])
+                                            return "".join(out_text_parts), calls, ""
+                                        # text before a section is safe to emit
+                                        out_text_parts.append(buf[pos:i])
+                                        j = buf.find(END, i)
+                                        if j == -1:
+                                            # Incomplete section; keep the rest buffered
+                                            return "".join(out_text_parts), calls, buf[i:]
+                                        # Extract and parse the complete section
+                                        section = buf[i : j + len(END)]
+                                        norm_text, tcalls = parse_mcp_tool_markup(section)
+                                        if norm_text:
+                                            out_text_parts.append(norm_text)
+                                        if tcalls:
+                                            calls.extend(tcalls)
+                                        pos = j + len(END)
+
+                                # Drain buffer into plain text and tool calls when possible
+                                drained_text, mcp_calls, mcp_left = _drain_mcp(mcp_buf)  # type: ignore
+                                mcp_buf = mcp_left  # type: ignore
+
+                                # First, emit any discovered tool calls from markup as tool_use blocks
+                                for call in mcp_calls:
                                     try:
-                                        normal_piece, call_items = parser.parse_stream_chunk(piece)
+                                        import json as _json
+                                        st_key = f"mcp_{len(tool_states)}"
+                                        st = {
+                                            "open": False,
+                                            "cb_index": next_block_index,
+                                            "id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                                            "name": call.get("name") or "",
+                                        }
+                                        tool_states[st_key] = st
+                                        cb_index = next_block_index
+                                        next_block_index += 1
+                                        yield sse(
+                                            "content_block_start",
+                                            {
+                                                "type": "content_block_start",
+                                                "index": cb_index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": st["id"],
+                                                    "name": st["name"],
+                                                    "input": {},
+                                                },
+                                            },
+                                        )
+                                        st["open"] = True
+                                        args_obj = call.get("input") or {}
+                                        if st["open"] and args_obj:
+                                            yield sse(
+                                                "content_block_delta",
+                                                {
+                                                    "type": "content_block_delta",
+                                                    "index": st["cb_index"],
+                                                    "delta": {"type": "input_json_delta", "partial_json": _json.dumps(args_obj)},
+                                                },
+                                            )
+                                    except Exception:
+                                        ...
+
+                                # Next, run sglang textual tool parser on remaining plain text
+                                normal_piece = drained_text
+                                if normal_piece and parser is not None:
+                                    try:
+                                        normal_piece, call_items = parser.parse_stream_chunk(normal_piece)
                                         for it in call_items or []:
                                             try:
                                                 import json as _json
@@ -520,10 +599,10 @@ async def messages(
                                                     },
                                                 )
                                     except Exception:
-                                        normal_piece = piece
+                                        ...
 
+                                # Finally, emit any remaining plain text
                                 if normal_piece:
-                                    # Start text block if not exists
                                     if text_block_index is None:
                                         text_block_index = next_block_index
                                         next_block_index += 1
@@ -535,7 +614,6 @@ async def messages(
                                                 "content_block": {"type": "text", "text": ""},
                                             },
                                         )
-                                    # Emit delta
                                     yield sse(
                                         "content_block_delta",
                                         {
@@ -544,8 +622,6 @@ async def messages(
                                             "delta": {"type": "text_delta", "text": normal_piece},
                                         },
                                     )
-
-                                # Note: No custom textual tool markup handling; rely on sglang parsing only
 
                             # Tool call deltas (support both delta.tool_calls and message.tool_calls)
                             tool_entries = delta.get("tool_calls") or ((choices[0].get("message") or {}).get("tool_calls") or [])
