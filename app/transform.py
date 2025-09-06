@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+import re
+import uuid
 
 # Use sglang's OpenAI protocol models for validation/normalization
 try:
@@ -187,6 +189,72 @@ def anthropic_to_openai_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 ## Removed custom model capability adaptation. OpenAI-side behavior is determined by sglang/OpenAI schema.
 
 
+def parse_mcp_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]]:
+    """Parse Cloud Code MCP tool-call markup into structured tool_use blocks.
+
+    Recognizes sections of the form:
+      <|tool_calls_section_begin|>
+        <|tool_call_begin|>functions.mcp__server__tool:1<|tool_call_argument_begin|>{...}<|tool_call_end|>
+      <|tool_calls_section_end|>
+
+    Returns (remaining_text_without_markup, tool_use_blocks)
+    """
+    if not text:
+        return text, []
+
+    BEG = "<|tool_calls_section_begin|>"
+    END = "<|tool_calls_section_end|>"
+    CALL_RE = re.compile(
+        r"<\|tool_call_begin\|>(.*?)<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>",
+        re.DOTALL,
+    )
+
+    out_text_parts: list[str] = []
+    calls: list[Dict[str, Any]] = []
+    pos = 0
+    n = len(text)
+
+    while pos < n:
+        i = text.find(BEG, pos)
+        if i == -1:
+            out_text_parts.append(text[pos:])
+            break
+        # text before the section
+        out_text_parts.append(text[pos:i])
+        j = text.find(END, i)
+        if j == -1:
+            # No closing tag; keep as plain text
+            out_text_parts.append(text[i:])
+            break
+        section = text[i + len(BEG) : j]
+        for m in CALL_RE.finditer(section):
+            full_name = (m.group(1) or "").strip()
+            args_raw = (m.group(2) or "").strip()
+            # Strip trailing :index and optional namespace prefix like "functions."
+            name = full_name
+            if name.startswith("functions.") or name.startswith("tools."):
+                name = name.split(".", 1)[1]
+            m_idx = re.match(r"^(.*?):\d+$", name)
+            if m_idx:
+                name = m_idx.group(1)
+            try:
+                args = json_loads_safe(args_raw)
+            except Exception:
+                args = {}
+            calls.append(
+                {
+                    "type": "tool_use",
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "name": name,
+                    "input": args if isinstance(args, dict) else {},
+                }
+            )
+        # Skip the whole section in output text
+        pos = j + len(END)
+
+    return "".join(out_text_parts), calls
+
+
 def choose_tool_call_parser(model_name: Optional[str]) -> str:
     s = (model_name or "").lower()
     if not s:
@@ -316,6 +384,10 @@ def openai_to_anthropic_response(
                     "input": args,
                 }
             )
+        # Parse Cloud Code MCP tool-call markup first
+        if text:
+            text, markup_calls = parse_mcp_tool_markup(text)
+            tool_calls_block.extend(markup_calls)
         # Fallback: use sglang parser on textual content when no structured tool_calls
         if not tcalls and text:
             text, parsed_calls = _maybe_parse_tools_with_sglang(text)
