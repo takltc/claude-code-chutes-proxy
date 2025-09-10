@@ -272,10 +272,12 @@ async def messages(
     chutes_url = f"{settings.chutes_base_url.rstrip('/')}/v1/chat/completions"
 
     if not is_stream:
-        # Auto-fix model case if configured
+        # Auto-fix model case if configured (pre-flight)
         if settings.auto_fix_model_case and oai_payload.get("model"):
             try:
                 fixed = await _resolve_case_variant(oai_payload["model"], _auth_headers(x_api_key, authorization))
+                if not fixed:
+                    fixed = _guess_case_for_known_models(oai_payload["model"])  # e.g., moonshotai/Kimi-K2-*
                 if fixed and fixed != oai_payload["model"]:
                     if settings.debug:
                         print(f"[proxy] non-stream: auto-fix model case '{oai_payload['model']}' -> '{fixed}'")
@@ -310,12 +312,59 @@ async def messages(
                         resp = await client.post(chutes_url, json=oai_payload, headers=_auth_headers(x_api_key, authorization))
                     except Exception:
                         ...
-            # Map upstream errors to Anthropic-like error envelope
+
+            # Map upstream errors to Anthropic-like error envelope (with targeted 404 retry on model casing)
             try:
                 data = resp.json()
                 message = data.get("error", {}).get("message") or data.get("message") or json.dumps(data)
             except Exception:
                 message = resp.text
+
+            # If the error suggests a missing model, attempt one-shot case/alias correction retry
+            should_retry_case = False
+            try:
+                msg_l = (message or "").lower()
+                if resp.status_code == 404 and ("model not found" in msg_l or "model" in msg_l and "not found" in msg_l):
+                    should_retry_case = True
+            except Exception:
+                should_retry_case = False
+
+            if should_retry_case:
+                try:
+                    headers0 = _auth_headers(x_api_key, authorization)
+                    original_model = str(oai_payload.get("model") or "")
+                    # First, try discovery-based resolution
+                    alt = await _resolve_case_variant(original_model, headers0)
+                    # If still none, try heuristic for known providers (e.g., Moonshot Kimi)
+                    if not alt:
+                        alt = _guess_case_for_known_models(original_model)
+                    if alt and alt != original_model:
+                        if settings.debug:
+                            try:
+                                print(f"[proxy] non-stream: retry on 404 with case-fixed model '{original_model}' -> '{alt}'")
+                            except Exception:
+                                ...
+                        # Retry once with the corrected id
+                        retry_payload = dict(oai_payload)
+                        retry_payload["model"] = alt
+                        _rec["resolved_model_retry"] = alt
+                        try:
+                            resp2 = await client.post(chutes_url, json=retry_payload, headers=headers0)
+                        except Exception:
+                            resp2 = None  # type: ignore
+                        if resp2 is not None and resp2.status_code < 400:
+                            data2 = resp2.json()
+                            _rec["phase"] = "non_stream_ok_after_404_retry"
+                            _RECENT.append(_rec)
+                            return JSONResponse(content=openai_to_anthropic_response(
+                                data2,
+                                requested_model=display_model,
+                                tools=retry_payload.get("tools"),
+                                tool_call_parser=choose_tool_call_parser(retry_payload.get("model")),
+                            ))
+                except Exception:
+                    ...
+
             _rec.update({"phase": "non_stream_error", "upstream_status": resp.status_code, "message": message})
             _RECENT.append(_rec)
             return JSONResponse(status_code=resp.status_code, content=_anthropic_error_for_status(resp.status_code, message))
@@ -343,6 +392,8 @@ async def messages(
         if settings.auto_fix_model_case and model_to_use:
             try:
                 resolved_model = await _resolve_case_variant(model_to_use, headers0)
+                if not resolved_model:
+                    resolved_model = _guess_case_for_known_models(model_to_use)
                 if resolved_model and resolved_model != model_to_use:
                     if settings.debug:
                         print(f"[proxy] stream: auto-fix model case '{model_to_use}' -> '{resolved_model}'")
