@@ -105,6 +105,22 @@ def _auth_headers(x_api_key: str | None = None, authorization: str | None = None
     return headers
 
 
+def _strip_thinking_suffix(model: Optional[str]) -> tuple[Optional[str], bool]:
+    """Strip trailing ":THINKING" (case-insensitive) from model id.
+
+    Returns (new_model, enabled) where enabled indicates that THINKING mode was requested.
+    """
+    if not model:
+        return model, False
+    try:
+        # Match only at end to avoid touching names that contain the token mid-string
+        if re.search(r":THINKING$", model, flags=re.IGNORECASE):
+            return re.sub(r":THINKING$", "", model, flags=re.IGNORECASE), True
+    except Exception:
+        ...
+    return model, False
+
+
 def _anthropic_error_for_status(status: int, message: str) -> Dict[str, Any]:
     t = "api_error"
     if status == 400:
@@ -326,6 +342,13 @@ async def messages(
     # Preserve original requested model casing for outward-facing responses
     display_model = parsed.model
 
+    # Handle DeepSeek THINKING suffix: strip from upstream model and enable header flag
+    thinking_enabled = False
+    _m, _en = _strip_thinking_suffix(oai_payload.get("model"))
+    if _en:
+        oai_payload["model"] = _m  # type: ignore
+        thinking_enabled = True
+
     # Choose streaming or not based on request
     is_stream = bool(oai_payload.get("stream"))
     chutes_url = f"{settings.chutes_base_url.rstrip('/')}/v1/chat/completions"
@@ -352,10 +375,13 @@ async def messages(
         _rec["resolved_model"] = oai_payload.get("model")
         client = _get_httpx_client()
         try:
+            headers0 = _auth_headers(x_api_key, authorization)
+            if thinking_enabled:
+                headers0["X-Enable-Thinking"] = "true"
             resp = await client.post(
                 chutes_url,
                 json=oai_payload,
-                headers=_auth_headers(x_api_key, authorization),
+                headers=headers0,
                 timeout=httpx.Timeout(120.0),
             )
         except Exception as e:
@@ -374,7 +400,7 @@ async def messages(
                         resp = await client.post(
                             chutes_url,
                             json=oai_payload,
-                            headers=_auth_headers(x_api_key, authorization),
+                            headers=headers0,
                             timeout=httpx.Timeout(120.0),
                         )
                     except Exception:
@@ -398,7 +424,7 @@ async def messages(
 
             if should_retry_case:
                 try:
-                    headers0 = _auth_headers(x_api_key, authorization)
+                    # Reuse existing headers with potential THINKING flag
                     original_model = str(oai_payload.get("model") or "")
                     # First, try discovery-based resolution
                     alt = await _resolve_case_variant(original_model, headers0)
@@ -456,6 +482,8 @@ async def messages(
         # Open connection to Chutes
         model_to_use = oai_payload.get("model")
         headers0 = _auth_headers(x_api_key, authorization)
+        if thinking_enabled:
+            headers0["X-Enable-Thinking"] = "true"
         # Avoid pre-flight discovery unless explicitly enabled; rely on 404 retry instead
         if settings.auto_fix_model_case and settings.auto_fix_model_case_preflight and model_to_use:
             try:

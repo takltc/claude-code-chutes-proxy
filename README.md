@@ -98,6 +98,26 @@ Body example:
 - If your Chutes backend already exposes OpenAI-compatible endpoints (e.g. vLLM/SGLang templates), you can point `CHUTES_BASE_URL` directly to that service.
  - Tool-call parsing: the proxy auto-selects an sglang parser per model family (LLaMA/Qwen/Mistral/DeepSeek/Kimi/GLM/GPT‑OSS). Models whose id contains `longcat` are parsed with the GPT‑OSS style detector, matching sglang’s approach.
 
+DeepSeek :THINKING Suffix
+
+- If you pass a model id that ends with `:THINKING` (case‑insensitive), the proxy will:
+  - Strip the `:THINKING` suffix before forwarding to the upstream backend model id.
+  - Add header `X-Enable-Thinking: true` to the upstream request.
+- Example:
+
+```bash
+curl -sS -X POST http://localhost:8090/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: YOUR_KEY' \
+  -d '{
+    "model": "deepseek-ai/DeepSeek-V3.1:THINKING",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "Think step-by-step"}]}]
+  }'
+```
+
+Upstream will receive JSON `model` as `deepseek-ai/DeepSeek-V3.1` with header `X-Enable-Thinking: true`.
+
 Environment Configuration
 
 ### Docker Compose with .env File
