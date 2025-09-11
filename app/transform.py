@@ -369,11 +369,16 @@ def openai_to_anthropic_response(
         first_choice = (oai.get("choices") or [{}])[0]
         message = first_choice.get("message") or {}
         text = message.get("content") or ""
-        # If available, include reasoning content as separate block prefix
+        # If available, include reasoning content as a dedicated thinking block (for proper UI display)
         reasoning = message.get("reasoning_content")
         reasoning_block = []
         if reasoning:
-            reasoning_block = [{"type": "text", "text": str(reasoning)}]
+            reasoning_block = [
+                {
+                    "type": "thinking",
+                    "thinking": str(reasoning),
+                }
+            ]
         # Convert OpenAI tool_calls to Anthropic tool_use blocks
         tcalls = message.get("tool_calls") or []
         for tc in tcalls:
@@ -414,7 +419,7 @@ def openai_to_anthropic_response(
     if text:
         if str(text).strip():
             content_blocks.append({"type": "text", "text": text})
-    # Prepend reasoning if present
+    # Prepend reasoning if present (as a thinking block)
     if 'reasoning_block' in locals() and reasoning_block:
         content_blocks = reasoning_block + content_blocks
     content_blocks.extend(tool_calls_block)

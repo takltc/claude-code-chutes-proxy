@@ -113,9 +113,12 @@ def _strip_thinking_suffix(model: Optional[str]) -> tuple[Optional[str], bool]:
     if not model:
         return model, False
     try:
-        # Match only at end to avoid touching names that contain the token mid-string
-        if re.search(r":THINKING$", model, flags=re.IGNORECASE):
-            return re.sub(r":THINKING$", "", model, flags=re.IGNORECASE), True
+        s = str(model).strip()
+        # support :thinking / :think / :reason / :reasoning suffixes (case-insensitive)
+        m = re.search(r":(thinking|think|reason|reasoning)\s*$", s, flags=re.IGNORECASE)
+        if m:
+            base = re.sub(r":(thinking|think|reason|reasoning)\s*$", "", s, flags=re.IGNORECASE)
+            return base, True
     except Exception:
         ...
     return model, False
@@ -142,6 +145,8 @@ def _anthropic_error_for_status(status: int, message: str) -> Dict[str, Any]:
 _MODEL_RESOLVE_CACHE: Dict[str, str] = {}
 # Cache for provider model ids to avoid frequent /v1/models calls
 _MODEL_LIST_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+# Cache of lowercase → canonical id maps per upstream/auth fingerprint
+_MODEL_CASE_MAP_CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
 _MODEL_CACHE_LOCK = asyncio.Lock()
 
 
@@ -172,6 +177,10 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
                 ent = (obj or {}).get(key)
                 if ent and isinstance(ent.get("ids"), list):
                     ids = [str(x) for x in ent.get("ids")]
+                    # Populate case map cache if present
+                    lmap = ent.get("lower_map") if isinstance(ent, dict) else None
+                    if isinstance(lmap, dict):
+                        _MODEL_CASE_MAP_CACHE[key] = (now, {str(k): str(v) for k, v in lmap.items()})
                     # Populate in-memory cache to avoid future file I/O
                     _MODEL_LIST_CACHE[key] = (now, ids)
                     return ids
@@ -199,6 +208,16 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
         elif isinstance(it, str):
             ids.append(it)
     _MODEL_LIST_CACHE[key] = (now, ids)
+    # Build and cache lowercase → canonical map
+    lower_map: Dict[str, str] = {}
+    for mid in ids:
+        try:
+            if isinstance(mid, str):
+                norm = str(mid).strip().lower()
+                lower_map[norm] = mid
+        except Exception:
+            ...
+    _MODEL_CASE_MAP_CACHE[key] = (now, lower_map)
     # Persist to disk
     if settings.model_discovery_persist:
         try:
@@ -211,12 +230,53 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
                             obj = json.load(f) or {}
                     except Exception:
                         obj = {}
-                obj[key] = {"ids": ids, "ts": int(now), "base_url": settings.chutes_base_url}
+                obj[key] = {
+                    "ids": ids,               # canonical ids as returned by provider
+                    "ids_lower": [i.lower() for i in ids],  # purely lowercased list for quick contains
+                    "lower_map": lower_map,    # lowercase → canonical
+                    "ts": int(now),
+                    "base_url": settings.chutes_base_url,
+                }
                 with open(settings.model_cache_file, "w", encoding="utf-8") as f:
                     json.dump(obj, f, ensure_ascii=False, indent=2)
         except Exception:
             ...
     return ids
+
+
+async def _get_model_case_map(headers: Dict[str, str]) -> Optional[Dict[str, str]]:
+    key = _models_cache_key(headers)
+    now = asyncio.get_event_loop().time()
+    ttl = max(5, int(getattr(settings, "model_discovery_ttl", 300)))
+    # in-memory
+    if key in _MODEL_CASE_MAP_CACHE:
+        ts, mp = _MODEL_CASE_MAP_CACHE[key]
+        if now - ts < ttl:
+            return mp
+    # disk
+    if settings.model_discovery_persist and os.path.exists(settings.model_cache_file):
+        try:
+            with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                obj = json.load(f) or {}
+            ent = obj.get(key)
+            if isinstance(ent, dict) and isinstance(ent.get("lower_map"), dict):
+                mp = {str(k): str(v) for k, v in ent.get("lower_map").items()}
+                _MODEL_CASE_MAP_CACHE[key] = (now, mp)
+                return mp
+        except Exception:
+            ...
+    # Build from ids if available
+    ids = await _get_model_ids(headers)
+    if ids:
+        mp: Dict[str, str] = {}
+        for mid in ids:
+            try:
+                mp[mid.lower()] = mid
+            except Exception:
+                ...
+        _MODEL_CASE_MAP_CACHE[key] = (now, mp)
+        return mp
+    return None
 
 
 async def _try_resolve_model(
@@ -268,42 +328,17 @@ def _guess_case_for_known_models(requested_model: str) -> str | None:
 async def _resolve_case_variant(
     requested_model: str, headers: Dict[str, str]
 ) -> str | None:
-    """Resolve to provider-registered model id when request differs by case or common suffixes.
+    """Resolve canonical model id using cached lowercase→canonical map without network calls.
 
-    Strategy:
-    1) exact id in list -> return as is
-    2) case-insensitive equality -> return canonical id
-    3) fuzzy fallback: strip common trailing size/context suffixes (e.g., -75k) and match
+    Falls back to prior heuristic only if cache is unavailable.
     """
-    import re
-
-    def _normalize(mid: str) -> str:
-        s = (mid or "").strip().lower().replace("_", "-")
-        # Drop trailing size/context suffixes like -32k/-64k/-75k/-100k/-128k
-        s = re.sub(r"-\s*\d+\s*[kK]$", "", s)
-        return s
-
-    ids = await _get_model_ids(headers)
-    if not ids:
-        return None
-    # 1) exact match
-    if requested_model in ids:
-        return requested_model
-    # 2) case-insensitive equality
-    req_lower = requested_model.lower()
-    lower_map = {str(mid).lower(): str(mid) for mid in ids if isinstance(mid, str)}
-    if req_lower in lower_map and lower_map[req_lower] != requested_model:
-        return lower_map[req_lower]
-    # 3) fuzzy normalize (e.g., drop -75k, unify separators)
-    req_norm = _normalize(requested_model)
-    norm_map: Dict[str, str] = {}
-    for mid in ids:
-        if isinstance(mid, str):
-            norm = _normalize(mid)
-            norm_map[norm] = mid
-    if req_norm in norm_map and norm_map[req_norm] != requested_model:
-        return norm_map[req_norm]
-    # 4) heuristic last-resort for known providers when discovery failed
+    mp = await _get_model_case_map(headers)
+    if mp:
+        # direct lowercase map
+        val = mp.get(requested_model.lower())
+        if val:
+            return val
+    # Last-resort heuristic
     try:
         guessed = _guess_case_for_known_models(requested_model)
         if guessed and guessed != requested_model:
@@ -319,6 +354,7 @@ async def messages(
     anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
     authorization: str | None = Header(default=None, alias="authorization"),
+    x_enable_thinking: str | None = Header(default=None, alias="X-Enable-Thinking"),
 ):
     _rec: Dict[str, Any] = {"phase": "start"}
     try:
@@ -336,6 +372,19 @@ async def messages(
         )
     _rec["request_model"] = parsed.model
 
+    # Capture original model and detect :thinking-like suffix before any mapping
+    _orig_model = parsed.model
+    _orig_base, _orig_en = _strip_thinking_suffix(_orig_model)
+    think_trace = {
+        "model_in": _orig_model,
+        "orig_suffix": bool(_orig_en),
+        "payload_suffix": False,
+        "body_thinking": False,
+        "body_reasoning": False,
+        "inbound_header": False,
+        "final_enabled": False,
+    }
+
     # Build OpenAI payload for Chutes（OpenAI 侧仅使用 sglang 协议模型校验/构造）
     oai_payload = anthropic_to_openai_payload(parsed.model_dump())
     _rec["oai_model"] = oai_payload.get("model")
@@ -343,11 +392,39 @@ async def messages(
     display_model = parsed.model
 
     # Handle DeepSeek THINKING suffix: strip from upstream model and enable header flag
-    thinking_enabled = False
+    thinking_enabled = bool(_orig_en)
     _m, _en = _strip_thinking_suffix(oai_payload.get("model"))
     if _en:
         oai_payload["model"] = _m  # type: ignore
         thinking_enabled = True
+    think_trace["payload_suffix"] = bool(_en)
+    # Also enable if caller provides explicit thinking/reasoning flags in the request body
+    try:
+        raw_body = body or {}
+        if isinstance(raw_body.get("thinking"), dict):
+            t = raw_body["thinking"]
+            if (t.get("type") == "enabled") or (int(t.get("budget_tokens", 0)) > 0):
+                thinking_enabled = True
+                think_trace["body_thinking"] = True
+        if isinstance(raw_body.get("reasoning"), dict):
+            r = raw_body["reasoning"]
+            if r.get("enabled") or int(r.get("max_tokens", 0)) > 0:
+                thinking_enabled = True
+                think_trace["body_reasoning"] = True
+    except Exception:
+        ...
+    # Respect inbound X-Enable-Thinking header if provided
+    if (x_enable_thinking or "").lower() in ("1", "true", "yes", "on", "enable", "enabled"):
+        thinking_enabled = True
+        think_trace["inbound_header"] = True
+    think_trace["final_enabled"] = bool(thinking_enabled)
+
+    # Optional verbose trace for thinking detection
+    if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+        try:
+            print("[proxy] thinking-detect:", json.dumps(think_trace, ensure_ascii=False))
+        except Exception:
+            ...
 
     # Choose streaming or not based on request
     is_stream = bool(oai_payload.get("stream"))
@@ -366,7 +443,7 @@ async def messages(
                     oai_payload["model"] = fixed
             except Exception:
                 ...
-        if settings.debug:
+        if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
             try:
                 print("[proxy] upstream payload (non-stream):", json.dumps({"url": chutes_url, **{k: v for k, v in oai_payload.items() if k != "messages"}, "model": oai_payload.get("model")}))
             except Exception:
@@ -378,6 +455,18 @@ async def messages(
             headers0 = _auth_headers(x_api_key, authorization)
             if thinking_enabled:
                 headers0["X-Enable-Thinking"] = "true"
+            if settings.debug:
+                try:
+                    redacted = {
+                        k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
+                        for k, v in headers0.items()
+                    }
+                    print(
+                        "[proxy] upstream request (non-stream):",
+                        json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
+                    )
+                except Exception:
+                    ...
             resp = await client.post(
                 chutes_url,
                 json=oai_payload,
@@ -442,6 +531,18 @@ async def messages(
                         retry_payload["model"] = alt
                         _rec["resolved_model_retry"] = alt
                         try:
+                            if settings.debug:
+                                try:
+                                    redacted = {
+                                        k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
+                                        for k, v in headers0.items()
+                                    }
+                                    print(
+                                        "[proxy] upstream request (non-stream, retry):",
+                                        json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
+                                    )
+                                except Exception:
+                                    ...
                             resp2 = await client.post(chutes_url, json=retry_payload, headers=headers0)
                         except Exception:
                             resp2 = None  # type: ignore
@@ -475,8 +576,30 @@ async def messages(
 
     # Streaming path
     async def event_stream() -> AsyncIterator[bytes]:
-        # Helper to format SSE
+        # Helper to format SSE (with optional debug printing)
+        debug_sse = os.environ.get("DEBUG_SSE", "").lower() in ("1", "true", "yes", "on")
+        req_id = uuid.uuid4().hex[:8]
+        current_msg_id: Optional[str] = None
         def sse(event: str, data: Dict[str, Any]) -> bytes:
+            nonlocal current_msg_id
+            try:
+                if debug_sse:
+                    # Add lightweight correlation for concurrent streams
+                    mid = None
+                    if event == "message_start":
+                        mid = (data.get("message") or {}).get("id")
+                    elif event in ("message_delta", "message_stop"):
+                        mid = current_msg_id
+                    else:
+                        mid = current_msg_id
+                    print(f"[sse][{req_id}]{'['+str(mid)+']' if mid else ''}", event, json.dumps(data, ensure_ascii=False))
+                if event == "message_start":
+                    try:
+                        current_msg_id = (data.get("message") or {}).get("id")
+                    except Exception:
+                        current_msg_id = None
+            except Exception:
+                ...
             return f"event: {event}\n".encode() + f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
         # Open connection to Chutes
@@ -484,15 +607,13 @@ async def messages(
         headers0 = _auth_headers(x_api_key, authorization)
         if thinking_enabled:
             headers0["X-Enable-Thinking"] = "true"
-        # Avoid pre-flight discovery unless explicitly enabled; rely on 404 retry instead
-        if settings.auto_fix_model_case and settings.auto_fix_model_case_preflight and model_to_use:
+        # Map to canonical casing via cached lowercase map (no network RTT)
+        if model_to_use:
             try:
                 resolved_model = await _resolve_case_variant(model_to_use, headers0)
-                if not resolved_model:
-                    resolved_model = _guess_case_for_known_models(model_to_use)
                 if resolved_model and resolved_model != model_to_use:
                     if settings.debug:
-                        print(f"[proxy] stream: auto-fix model case '{model_to_use}' -> '{resolved_model}'")
+                        print(f"[proxy] stream: resolve model '{model_to_use}' -> '{resolved_model}' (cache)")
                     model_to_use = resolved_model
             except Exception:
                 ...
@@ -501,24 +622,38 @@ async def messages(
         if model_to_use:
             stream_payload["model"] = model_to_use
         _rec["resolved_model"] = model_to_use
-        if settings.debug:
+        if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
             try:
                 print("[proxy] upstream payload (stream):", json.dumps({"url": chutes_url, **{k: v for k, v in stream_payload.items() if k != "messages"}, "model": model_to_use}))
             except Exception:
                 pass
         client = _get_httpx_client()
 
-        async def _open_stream(payload_model: str):
-            return await client.stream(
+        def _open_stream(payload_model: str):
+            # Log upstream URL + headers (redacted) for debugging
+            _headers_stream = {**headers0, "Accept": "text/event-stream"}
+            if settings.debug:
+                try:
+                    redacted = {
+                        k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
+                        for k, v in _headers_stream.items()
+                    }
+                    print(
+                        "[proxy] upstream request (stream):",
+                        json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
+                    )
+                except Exception:
+                    ...
+            return client.stream(
                 "POST",
                 chutes_url,
                 json={**stream_payload, "model": payload_model},
-                headers={**headers0, "Accept": "text/event-stream"},
+                headers=_headers_stream,
                 timeout=None,
             )
 
         try:
-            upstream_cm = await _open_stream(model_to_use)
+            upstream_cm = _open_stream(model_to_use)
             async with upstream_cm as upstream:
                 _rec["phase"] = f"stream_status_{upstream.status_code}"
                 # Anthropic stream scaffold
@@ -527,6 +662,7 @@ async def messages(
                 model_name = None
                 usage_input = 0
                 usage_output = 0
+                emitted_tool_use = False
 
                 # Content block management
                 next_block_index = 0
@@ -542,10 +678,30 @@ async def messages(
                             "role": "assistant",
                             # Outward-facing: always echo the originally requested casing
                             "model": display_model or model_name or stream_payload.get("model", "unknown-model"),
-                            "content": [{"type": "text", "text": ""}],
+                            # Start with empty content to align with Anthropic stream semantics
+                            "content": [],
+                            # Provide a usage object upfront to satisfy clients that read it early
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                            "stop_reason": None,
+                            "stop_sequence": None,
                         }
                         sent_start = True
                         return sse("message_start", {"type": "message_start", "message": msg})
+                    return None
+
+                def ensure_text_block():
+                    nonlocal text_block_index, next_block_index
+                    if text_block_index is None:
+                        text_block_index = next_block_index
+                        next_block_index += 1
+                        return sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            },
+                        )
                     return None
 
                 # Prepare sglang FunctionCallParser if tools exist and enabled
@@ -583,6 +739,32 @@ async def messages(
                 # Buffer for Cloud Code MCP tool-call markup across stream chunks
                 mcp_buf = ""
 
+                # Tool names come only from the current request's declared tools
+                try:
+                    known_tools: list[str] = [t.name for t in (parsed.tools or []) if getattr(t, "name", None)]
+                except Exception:
+                    known_tools = []
+                if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+                    try:
+                        print("[proxy] declared tools:", json.dumps(known_tools, ensure_ascii=False))
+                    except Exception:
+                        ...
+
+                # Track a dedicated thinking block for reasoning deltas
+                thinking_block_index: Optional[int] = None
+                thinking_open = False
+                # Buffer for MCP tool markup that appears inside thinking content
+                think_mcp_buf = ""
+                # Buffer for any normal text that arrives in the same chunk as thinking
+                pending_text_after_thinking = ""
+
+                # Hysteresis to avoid rapid flip from thinking->text within the very next chunk
+                try:
+                    hysteresis = int(os.environ.get("REASONING_HYSTERESIS", "2"))
+                except Exception:
+                    hysteresis = 2
+                no_reasoning_streak = 0
+
                 async for line in upstream.aiter_lines():
                         if not line:
                             continue
@@ -594,16 +776,21 @@ async def messages(
                             if text_block_index is not None:
                                 yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
                                 text_block_index = None
+                            if thinking_open and thinking_block_index is not None:
+                                yield sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                                thinking_open = False
+                                thinking_block_index = None
                             for st in list(tool_states.values()):
                                 if st.get("open"):
                                     yield sse("content_block_stop", {"type": "content_block_stop", "index": st["cb_index"]})
                                     st["open"] = False
                             # Final message_delta and stop
+                            final_stop = "tool_use" if emitted_tool_use else "end_turn"
                             yield sse(
                                 "message_delta",
                                 {
                                     "type": "message_delta",
-                                    "delta": {"stop_reason": "end_turn"},
+                                    "delta": {"stop_reason": final_stop, "stop_sequence": None},
                                     "usage": {"input_tokens": usage_input, "output_tokens": usage_output},
                                 },
                             )
@@ -625,46 +812,488 @@ async def messages(
                         choices = chunk.get("choices") or []
                         if choices:
                             delta = (choices[0].get("delta") or {})
-                            # Text piece
-                            piece = delta.get("content") or ""
-                            if piece:
+
+                            # Handle reasoning/thinking stream first
+                            # Support either OpenAI reasoning models (delta.reasoning_content)
+                            # or upstream-transformed shape (delta.thinking.{content|signature})
+                            reasoning_piece = delta.get("reasoning_content") or None
+                            thinking_obj = delta.get("thinking") or {}
+                            thinking_signature = None
+                            if isinstance(thinking_obj, dict):
+                                thinking_signature = thinking_obj.get("signature")
+                                if not reasoning_piece and thinking_obj.get("content"):
+                                    reasoning_piece = thinking_obj.get("content")
+
+                            if reasoning_piece:
+                                no_reasoning_streak = 0
                                 if not sent_start:
                                     ms = ensure_message_start()
                                     if ms:
                                         yield ms
+                                # Normalize potential fullwidth markers used by some models
+                                try:
+                                    norm_reason = (
+                                        str(reasoning_piece)
+                                        .replace("｜", "|")
+                                        .replace("▁", "_")
+                                    )
+                                except Exception:
+                                    norm_reason = str(reasoning_piece)
+
+                                # Accumulate thinking raw text into buffer
+                                think_mcp_buf += norm_reason
+
+                                # Helper: drain unmarked calls like "ToolName{...json...}" from buffer or plain text.
+                                # Returns (plain_text, calls_for_declared_tools, leftover, moved_unknown)
+                                def _drain_unmarked_calls(buf: str, tool_names: list[str], hold_tail_for_declared: bool = True):
+                                    import re as _re
+                                    import json as _json
+                                    # If we know no tool names, still detect generic pattern to strip from thinking
+                                    # Generic name pattern keeps it provider-agnostic, no hardcoding of names
+                                    declared = set([n for n in (tool_names or []) if isinstance(n, str) and n])
+                                    pat = _re.compile(r"\b([A-Za-z][A-Za-z0-9_\-\.]{0,80})\s*\{", _re.DOTALL)
+                                    out_parts: list[str] = []
+                                    calls: list[dict] = []
+                                    moved_unknown: list[str] = []
+                                    pos = 0
+                                    n = len(buf)
+                                    while pos < n:
+                                        m = pat.search(buf, pos)
+                                        if not m:
+                                            out_parts.append(buf[pos:])
+                                            break
+                                        start = m.start()
+                                        name = (m.group(1) or "").strip()
+                                        # Emit preceding text
+                                        out_parts.append(buf[pos:start])
+                                        # Find balanced JSON object starting at the "{" right after the match
+                                        brace_start = m.end() - 1  # points at '{'
+                                        i = brace_start
+                                        depth = 0
+                                        in_str = False
+                                        esc = False
+                                        end = -1
+                                        while i < n:
+                                            ch = buf[i]
+                                            if esc:
+                                                esc = False
+                                            elif ch == "\\":
+                                                esc = True
+                                            elif ch == '"':
+                                                in_str = not in_str
+                                            elif not in_str:
+                                                if ch == "{":
+                                                    depth += 1
+                                                elif ch == "}":
+                                                    depth -= 1
+                                                    if depth == 0:
+                                                        end = i
+                                                        break
+                                            i += 1
+                                        # If not complete, keep the whole match for next chunk
+                                        if end == -1:
+                                            # Put back the unmatched segment
+                                            leftover = buf[start:]
+                                            return "".join(out_parts), calls, leftover, ""
+                                        # Try to parse JSON slice
+                                        json_slice = buf[brace_start : end + 1]
+                                        try:
+                                            args = _json.loads(json_slice)
+                                        except Exception:
+                                            # Not valid JSON yet; keep for next chunk
+                                            leftover = buf[start:]
+                                            return "".join(out_parts), calls, leftover, ""
+                                        # It is a valid call: record and advance
+                                        if name in declared:
+                                            calls.append({
+                                                "type": "tool_use",
+                                                "id": f"call_{uuid.uuid4().hex}",
+                                                "name": name,
+                                                "input": args if isinstance(args, dict) else {},
+                                            })
+                                        else:
+                                            # Unknown tool name: move out of thinking to normal text later
+                                            moved_unknown.append(f"{name}{json_slice}")
+                                        pos = end + 1
+                                    text_out = "".join(out_parts)
+                                    leftover = ""
+                                    # Hold back a trailing declared tool name without '{' to avoid leaking (e.g., 'Bash' then next chunk '{...}')
+                                    if hold_tail_for_declared and text_out:
+                                        tail = text_out[-128:]
+                                        # First, prefer declared names when provided
+                                        if declared:
+                                            for name in sorted(declared, key=len, reverse=True):
+                                                if not name:
+                                                    continue
+                                                if tail.rstrip().endswith(name):
+                                                    idx = text_out.rstrip().rfind(name)
+                                                    if idx != -1 and (idx == 0 or not text_out[idx-1].isalnum()):
+                                                        keep = text_out[:idx]
+                                                        hold = text_out[idx:]
+                                                        text_out = keep
+                                                        leftover = hold + leftover
+                                                        break
+                                        else:
+                                            # Generic conservative hold: if the suffix looks like a single identifier token
+                                            # (no punctuation, <= 40 chars), keep it in leftover to wait for a possible '{' next chunk.
+                                            # This avoids leaking sequences like 'Read' or 'Write' into thinking.
+                                            import re as _re2
+                                            m = _re2.search(r"([A-Za-z][A-Za-z0-9_\-\.]{0,39})\s*$", tail)
+                                            if m:
+                                                token = m.group(1)
+                                                # Avoid common short English words that are unlikely to be tool names
+                                                if token.lower() not in {"a", "an", "the", "and", "or", "to", "in", "on", "of", "for"}:
+                                                    idx = text_out.rfind(token)
+                                                    if idx != -1:
+                                                        keep = text_out[:idx]
+                                                        hold = text_out[idx:]
+                                                        text_out = keep
+                                                        leftover = hold + leftover
+                                    return text_out, calls, leftover, "".join(moved_unknown)
+
+                                # If this chunk also carries normal content, buffer it for next non-thinking chunk to avoid mixing
+                                aux_text = delta.get("content") or ""
+                                if aux_text:
+                                    try:
+                                        aux_text = (
+                                            str(aux_text).replace("｜", "|").replace("▁", "_")
+                                        )
+                                    except Exception:
+                                        aux_text = str(aux_text)
+                                    pending_text_after_thinking += aux_text
+
+                                def _parse_simple_calls(section: str):
+                                    import re as _re
+                                    simple_calls: list[dict] = []
+                                    pattern = _re.compile(r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>", _re.DOTALL)
+                                    for m in pattern.finditer(section):
+                                        name = (m.group(1) or '').strip()
+                                        args_raw = (m.group(2) or '').strip()
+                                        try:
+                                            import json as _json
+                                            args = _json.loads(args_raw)
+                                        except Exception:
+                                            args = {}
+                                        simple_calls.append({
+                                            "type": "tool_use",
+                                            "id": f"call_{uuid.uuid4().hex}",
+                                            "name": name,
+                                            "input": args if isinstance(args, dict) else {}
+                                        })
+                                    return simple_calls
+
+                                def _is_marker_only(text: str) -> bool:
+                                    try:
+                                        import re as _re
+                                        s = text or ""
+                                        # Remove all known tool markers
+                                        s = _re.sub(r"<\|tool_(calls_)?(begin|end)\|>", "", s)
+                                        s = _re.sub(r"<\|tool_call_(begin|end)\|>", "", s)
+                                        s = _re.sub(r"<\|tool_sep\|>", "", s)
+                                        # Drop whitespace/newlines
+                                        s = s.strip()
+                                        return len(s) == 0
+                                    except Exception:
+                                        return False
+
+                                def _drain_mcp_thinking(buf: str):
+                                    BEG1 = "<|tool_calls_section_begin|>"; END1 = "<|tool_calls_section_end|>"
+                                    BEG2 = "<|tool_calls_begin|>"; END2 = "<|tool_calls_end|>"
+                                    out_text_parts: list[str] = []
+                                    calls: list[dict] = []
+                                    pos = 0
+                                    n = len(buf)
+                                    while pos < n:
+                                        i1 = buf.find(BEG1, pos); i2 = buf.find(BEG2, pos)
+                                        # pick earliest begin marker
+                                        candidates = [x for x in [i1, i2] if x != -1]
+                                        if not candidates:
+                                            out_text_parts.append(buf[pos:])
+                                            break
+                                        i = min(candidates)
+                                        out_text_parts.append(buf[pos:i])
+                                        if i == i1:
+                                            j = buf.find(END1, i)
+                                            if j == -1:
+                                                # incomplete
+                                                return "".join(out_text_parts), calls, buf[i:]
+                                            section = buf[i:j+len(END1)]
+                                            norm_text, tcalls = parse_mcp_tool_markup(section)
+                                            if norm_text:
+                                                out_text_parts.append(norm_text)
+                                            if tcalls:
+                                                calls.extend(tcalls)
+                                            pos = j + len(END1)
+                                        else:
+                                            j = buf.find(END2, i)
+                                            if j == -1:
+                                                return "".join(out_text_parts), calls, buf[i:]
+                                            section = buf[i:j+len(END2)]
+                                            tcalls = _parse_simple_calls(section)
+                                            # simple style has no replacement text
+                                            if tcalls:
+                                                calls.extend(tcalls)
+                                            pos = j + len(END2)
+                                    return "".join(out_text_parts), calls, ""
+
+                                # Drain markers first against the entire buffer
+                                drained1, calls1, left1 = _drain_mcp_thinking(think_mcp_buf)
+                                # Then drain unmarked calls against the plain text returned from marker drain
+                                drained2, calls2, left2, moved_unknown = _drain_unmarked_calls(drained1, known_tools, hold_tail_for_declared=True)
+
+                                drained_think_text = drained2  # only fully safe plain text
+                                think_calls = []
+                                if calls1:
+                                    think_calls.extend(calls1)
+                                if calls2:
+                                    think_calls.extend(calls2)
+                                # Leftover may be from open tool section or partial unmarked JSON; keep both
+                                think_mcp_buf = (left1 or "") + (left2 or "")
+                                if moved_unknown:
+                                    pending_text_after_thinking += moved_unknown
+
+                                # If there are calls found inside the thinking stream, close thinking block before tool_use
+                                if think_calls:
+                                    # Emit any accumulated thinking text first (skip if only markers/whitespace)
+                                    if drained_think_text and not _is_marker_only(drained_think_text):
+                                        if not thinking_open:
+                                            cb_index = next_block_index
+                                            next_block_index += 1
+                                            thinking_block_index = cb_index
+                                            thinking_open = True
+                                            yield sse(
+                                                "content_block_start",
+                                                {
+                                                    "type": "content_block_start",
+                                                    "index": cb_index,
+                                                    "content_block": {"type": "thinking", "thinking": ""},
+                                                },
+                                            )
+                                        yield sse(
+                                            "content_block_delta",
+                                            {
+                                                "type": "content_block_delta",
+                                                "index": thinking_block_index,
+                                                "delta": {"type": "thinking_delta", "thinking": drained_think_text},
+                                            },
+                                        )
+                                    if thinking_open and thinking_block_index is not None:
+                                        yield sse(
+                                            "content_block_stop",
+                                            {"type": "content_block_stop", "index": thinking_block_index},
+                                        )
+                                        thinking_open = False
+                                        thinking_block_index = None
+
+                                    # Emit tool_use blocks for each parsed call
+                                for call in think_calls:
+                                    cb_index = next_block_index
+                                    next_block_index += 1
+                                    call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
+                                    call_name = call.get("name") or "tool"
+                                    call_args = call.get("input") or {}
+                                    yield sse(
+                                        "content_block_start",
+                                        {
+                                            "type": "content_block_start",
+                                            "index": cb_index,
+                                            "content_block": {
+                                                "type": "tool_use",
+                                                "id": call_id,
+                                                "name": call_name,
+                                                "input": {},
+                                            },
+                                        },
+                                    )
+                                    try:
+                                        import json as _json
+                                        args_str = _json.dumps(call_args, ensure_ascii=False)
+                                    except Exception:
+                                        args_str = "{}"
+                                    yield sse(
+                                        "content_block_delta",
+                                        {
+                                            "type": "content_block_delta",
+                                            "index": cb_index,
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": args_str,
+                                            },
+                                        },
+                                    )
+                                    yield sse(
+                                        "content_block_stop",
+                                        {"type": "content_block_stop", "index": cb_index},
+                                    )
+                                    emitted_tool_use = True
+                                    # After tool_use, we keep thinking closed; it will reopen on next reasoning chunk
+                                else:
+                                    # No complete tool calls found in this reasoning chunk.
+                                    # Only stream the drained plain text (excludes any partial unmarked-call leftovers).
+                                    if drained_think_text and not _is_marker_only(drained_think_text):
+                                        if not thinking_open:
+                                            cb_index = next_block_index
+                                            next_block_index += 1
+                                            thinking_block_index = cb_index
+                                            thinking_open = True
+                                            yield sse(
+                                                "content_block_start",
+                                                {
+                                                    "type": "content_block_start",
+                                                    "index": cb_index,
+                                                    "content_block": {"type": "thinking", "thinking": ""},
+                                                },
+                                            )
+                                        yield sse(
+                                            "content_block_delta",
+                                            {
+                                                "type": "content_block_delta",
+                                                "index": thinking_block_index,
+                                                "delta": {"type": "thinking_delta", "thinking": drained_think_text},
+                                            },
+                                        )
+                                    # If nothing was drained (likely we're mid-JSON), hold output to avoid leaking JSON
+                                # Since we handled thinking (and possibly tool) in this chunk, do not process normal text again
+                                continue
+                            # Signature ends the thinking block if provided
+                            if thinking_signature and thinking_open and thinking_block_index is not None:
+                                yield sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": thinking_block_index,
+                                        "delta": {"type": "signature_delta", "signature": thinking_signature},
+                                    },
+                                )
+                                yield sse(
+                                    "content_block_stop",
+                                    {"type": "content_block_stop", "index": thinking_block_index},
+                                )
+                                thinking_open = False
+                                thinking_block_index = None
+
+                            # Text piece
+                            piece = delta.get("content") or ""
+                            if piece:
+                                # If we're coming right after reasoning, delay text for a short hysteresis window
+                                if thinking_open:
+                                    no_reasoning_streak += 1
+                                else:
+                                    no_reasoning_streak = 0
+                                if not sent_start:
+                                    ms = ensure_message_start()
+                                    if ms:
+                                        yield ms
+                                # If text arrives while thinking is open, we will only close thinking immediately
+                                # when we have a structured tool call to emit; otherwise we buffer text until
+                                # no_reasoning_streak reaches hysteresis to avoid mixing.
                                 # Handle Cloud Code MCP tool-call markup robustly across stream chunks
                                 BEG = "<|tool_calls_section_begin|>"
                                 END = "<|tool_calls_section_end|>"
                                 # Buffer for potential split markup across deltas
-                                mcp_buf += piece  # type: ignore
+                                # Normalize potential fullwidth markers used by some models
+                                try:
+                                    norm_piece = (
+                                        piece.replace("｜", "|")  # fullwidth vertical bar -> ASCII
+                                        .replace("▁", "_")        # SentencePiece underscore glyph -> '_'
+                                    )
+                                except Exception:
+                                    norm_piece = piece
+                                mcp_buf += norm_piece  # type: ignore
+
+                                def _parse_simple_calls(section: str):
+                                    import re as _re
+                                    simple_calls: list[dict] = []
+                                    pattern = _re.compile(r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>", _re.DOTALL)
+                                    for m in pattern.finditer(section):
+                                        name = (m.group(1) or '').strip()
+                                        args_raw = (m.group(2) or '').strip()
+                                        try:
+                                            import json as _json
+                                            args = _json.loads(args_raw)
+                                        except Exception:
+                                            args = {}
+                                        simple_calls.append({
+                                            "type": "tool_use",
+                                            "id": f"call_{uuid.uuid4().hex}",
+                                            "name": name,
+                                            "input": args if isinstance(args, dict) else {}
+                                        })
+                                    return simple_calls
 
                                 def _drain_mcp(buf: str):
+                                    BEG1 = "<|tool_calls_section_begin|>"; END1 = "<|tool_calls_section_end|>"
+                                    BEG2 = "<|tool_calls_begin|>"; END2 = "<|tool_calls_end|>"
                                     out_text_parts: list[str] = []
                                     calls: list[dict] = []
                                     pos = 0
-                                    while True:
-                                        i = buf.find(BEG, pos)
-                                        if i == -1:
+                                    n = len(buf)
+                                    while pos < n:
+                                        i1 = buf.find(BEG1, pos); i2 = buf.find(BEG2, pos)
+                                        candidates = [x for x in [i1, i2] if x != -1]
+                                        if not candidates:
                                             out_text_parts.append(buf[pos:])
-                                            return "".join(out_text_parts), calls, ""
-                                        # text before a section is safe to emit
+                                            break
+                                        i = min(candidates)
                                         out_text_parts.append(buf[pos:i])
-                                        j = buf.find(END, i)
-                                        if j == -1:
-                                            # Incomplete section; keep the rest buffered
-                                            return "".join(out_text_parts), calls, buf[i:]
-                                        # Extract and parse the complete section
-                                        section = buf[i : j + len(END)]
-                                        norm_text, tcalls = parse_mcp_tool_markup(section)
-                                        if norm_text:
-                                            out_text_parts.append(norm_text)
-                                        if tcalls:
-                                            calls.extend(tcalls)
-                                        pos = j + len(END)
+                                        if i == i1:
+                                            j = buf.find(END1, i)
+                                            if j == -1:
+                                                return "".join(out_text_parts), calls, buf[i:]
+                                            section = buf[i:j+len(END1)]
+                                            norm_text, tcalls = parse_mcp_tool_markup(section)
+                                            if norm_text:
+                                                out_text_parts.append(norm_text)
+                                            if tcalls:
+                                                calls.extend(tcalls)
+                                            pos = j + len(END1)
+                                        else:
+                                            j = buf.find(END2, i)
+                                            if j == -1:
+                                                return "".join(out_text_parts), calls, buf[i:]
+                                            section = buf[i:j+len(END2)]
+                                            tcalls = _parse_simple_calls(section)
+                                            if tcalls:
+                                                calls.extend(tcalls)
+                                            pos = j + len(END2)
+                                    return "".join(out_text_parts), calls, ""
 
                                 # Drain buffer into plain text and tool calls when possible
                                 drained_text, mcp_calls, mcp_left = _drain_mcp(mcp_buf)  # type: ignore
                                 mcp_buf = mcp_left  # type: ignore
+                                # Also drain unmarked calls like <ToolName>{...} from normal text stream (rare)
+                                if mcp_buf:
+                                    drained2, calls2, left2, moved_unknown = _drain_unmarked_calls(mcp_buf, known_tools, hold_tail_for_declared=False)
+                                    if drained2:
+                                        drained_text += drained2
+                                    if calls2:
+                                        mcp_calls.extend(calls2)
+                                    mcp_buf = left2  # type: ignore
+                                    if moved_unknown:
+                                        # Unrecognized tool snippets: keep them as plain text (not in thinking)
+                                        if not sent_start:
+                                            ms = ensure_message_start()
+                                            if ms:
+                                                yield ms
+                                        if text_block_index is None:
+                                            text_block_index = next_block_index
+                                            next_block_index += 1
+                                            yield sse(
+                                                "content_block_start",
+                                                {
+                                                    "type": "content_block_start",
+                                                    "index": text_block_index,
+                                                    "content_block": {"type": "text", "text": ""},
+                                                },
+                                            )
+                                        yield sse(
+                                            "content_block_delta",
+                                            {
+                                                "type": "content_block_delta",
+                                                "index": text_block_index,
+                                                "delta": {"type": "text_delta", "text": moved_unknown},
+                                            },
+                                        )
 
                                 # First, emit any discovered tool calls from markup as tool_use blocks
                                 for call in mcp_calls:
@@ -754,19 +1383,38 @@ async def messages(
                                     except Exception:
                                         ...
 
+                                # If there is buffered text carried over from a previous thinking chunk, emit it first
+                                if pending_text_after_thinking:
+                                    ts = ensure_text_block()
+                                    if ts:
+                                        yield ts
+                                    yield sse(
+                                        "content_block_delta",
+                                        {
+                                            "type": "content_block_delta",
+                                            "index": text_block_index,
+                                            "delta": {"type": "text_delta", "text": pending_text_after_thinking},
+                                        },
+                                    )
+                                    pending_text_after_thinking = ""
+
                                 # Finally, emit any remaining plain text
                                 if normal_piece:
-                                    if text_block_index is None:
-                                        text_block_index = next_block_index
-                                        next_block_index += 1
+                                    if thinking_open and thinking_block_index is not None and not mcp_calls and no_reasoning_streak < hysteresis:
+                                        # Defer text to avoid interleaving with thinking; accumulate and continue
+                                        pending_text_after_thinking += normal_piece
+                                        continue
+                                    # Close thinking once we've waited sufficient chunks or when there were tool calls
+                                    if thinking_open and thinking_block_index is not None:
                                         yield sse(
-                                            "content_block_start",
-                                            {
-                                                "type": "content_block_start",
-                                                "index": text_block_index,
-                                                "content_block": {"type": "text", "text": ""},
-                                            },
+                                            "content_block_stop",
+                                            {"type": "content_block_stop", "index": thinking_block_index},
                                         )
+                                        thinking_open = False
+                                        thinking_block_index = None
+                                    ts = ensure_text_block()
+                                    if ts:
+                                        yield ts
                                     yield sse(
                                         "content_block_delta",
                                         {
@@ -836,6 +1484,7 @@ async def messages(
                                             "delta": {"type": "input_json_delta", "partial_json": fargs},
                                         },
                                     )
+                                    emitted_tool_use = True
 
                         # Capture usage on final chunk when present
                         usage = chunk.get("usage")
@@ -847,19 +1496,47 @@ async def messages(
                         if choices and choices[0].get("finish_reason"):
                             fr = choices[0].get("finish_reason")
                             # Close blocks
+                            # Flush any deferred text moved out from thinking before closing blocks
+                            if pending_text_after_thinking:
+                                if not sent_start:
+                                    ms = ensure_message_start()
+                                    if ms:
+                                        yield ms
+                                if text_block_index is None:
+                                    text_block_index = next_block_index
+                                    next_block_index += 1
+                                    yield sse(
+                                        "content_block_start",
+                                        {"type": "content_block_start", "index": text_block_index, "content_block": {"type": "text", "text": ""}},
+                                    )
+                                yield sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": text_block_index,
+                                        "delta": {"type": "text_delta", "text": pending_text_after_thinking},
+                                    },
+                                )
+                                pending_text_after_thinking = ""
+
                             if text_block_index is not None:
                                 yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
                                 text_block_index = None
+                            if thinking_open and thinking_block_index is not None:
+                                yield sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                                thinking_open = False
+                                thinking_block_index = None
                             for st in list(tool_states.values()):
                                 if st.get("open"):
                                     yield sse("content_block_stop", {"type": "content_block_stop", "index": st["cb_index"]})
                                     st["open"] = False
                             # message_delta
+                            final_stop = "tool_use" if emitted_tool_use else map_finish_reason(fr)
                             yield sse(
                                 "message_delta",
                                 {
                                     "type": "message_delta",
-                                    "delta": {"stop_reason": map_finish_reason(fr)},
+                                    "delta": {"stop_reason": final_stop, "stop_sequence": None},
                                     "usage": {"input_tokens": usage_input, "output_tokens": usage_output},
                                 },
                             )
