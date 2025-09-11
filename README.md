@@ -9,6 +9,12 @@ Overview
   - Non-streaming: Anthropic `tools` + tool_use/tool_result ↔ OpenAI tool_calls/tool messages.
   - Streaming: tool_use bridging is supported (streams input_json_delta for function arguments).
 
+Performance Notes (Important)
+
+- Uses a shared HTTP client with connection pooling and optional HTTP/2 to reduce handshake latency.
+- Model discovery (`/v1/models`) is persisted to disk by default so subsequent boots do not re-fetch.
+- Streaming function-call parsing is optional to reduce per-chunk CPU; see `ENABLE_STREAM_TOOL_PARSER` below.
+
 Quickstart
 
 - Requirements: Python 3.10+ recommended (works with 3.13), `uvicorn` and `fastapi`.
@@ -126,12 +132,36 @@ All environment variables with their defaults and descriptions:
 | `MODEL_MAP` | `{}` | JSON string for model name mapping |
 | `TOOL_NAME_MAP` | `{}` | JSON string for tool name mapping |
 | `AUTO_FIX_MODEL_CASE` | `1` | Auto-correct model casing |
+| `AUTO_FIX_MODEL_CASE_PREFLIGHT` | `0` | For streaming: preflight model-case discovery before request (adds RTT). Keep `0` for speed; 404 will retry. |
 | `DEBUG_PROXY` | `0` | Enable request/response logging |
 | `PROXY_BACKOFF_ON_429` | `1` | Retry on rate limiting |
 | `PROXY_MAX_RETRY_ON_429` | `1` | Max retry attempts for 429 |
 | `PROXY_MAX_RETRY_AFTER` | `2` | Max retry-after seconds |
+| `PROXY_HTTP2` | `1` | Enable HTTP/2 when upstream supports it (faster/less latency) |
 | `UVICORN_WORKERS` | `1` | Uvicorn worker processes |
 | `PORT` | `8080` | Internal container port |
+| `MODEL_DISCOVERY_TTL` | `300` | In-memory TTL (seconds) for model list; disk persistence avoids re-fetch on restart |
+| `MODEL_DISCOVERY_PERSIST` | `1` | Persist `/v1/models` results to disk for reuse across restarts |
+| `MODEL_CACHE_FILE` | `~/.claude-code-chutes-proxy/models_cache.json` | Path to models cache JSON file |
+| `ENABLE_STREAM_TOOL_PARSER` | `0` | Enable sglang tool-call parser on streaming text (turn on only if you need inline tool markup parsing) |
+
+Persistent Model Discovery
+
+- The proxy persists `/v1/models` results to a JSON file keyed by upstream URL and a light auth fingerprint.
+- Default path: `~/.claude-code-chutes-proxy/models_cache.json`. Customize via `MODEL_CACHE_FILE`.
+- This avoids re-fetching the model list on every process start. Use the admin endpoints below to inspect/refresh/clear.
+
+Admin Endpoints
+
+- `GET /_models_cache` — Show current cache entry (ids, ts, base_url) for the active upstream/auth.
+- `POST /_models_cache/refresh` — Re-fetch from upstream and persist.
+- `DELETE /_models_cache` — Clear the current cache entry (memory + disk). Next request will re-create it.
+
+Recommended Settings for Speed
+
+- Keep `AUTO_FIX_MODEL_CASE_PREFLIGHT=0` (default) to avoid a preflight `/v1/models` call on streaming.
+- Keep `PROXY_HTTP2=1` (default) to leverage HTTP/2 if upstream supports it.
+- Keep `ENABLE_STREAM_TOOL_PARSER=0` (default). Turn on only when you need inline textual tool-call parsing during stream.
 
 Docker
 

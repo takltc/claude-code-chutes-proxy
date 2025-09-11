@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import uuid
 
 import httpx
+import os
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from collections import deque
@@ -27,6 +28,32 @@ from .transform import (
 
 
 app = FastAPI(title="Claude-to-Chutes Proxy")
+
+# Shared HTTP client (HTTP/1.1 + optional HTTP/2) with connection pooling
+_HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_httpx_client() -> httpx.AsyncClient:
+    global _HTTPX_CLIENT
+    if _HTTPX_CLIENT is None:
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        )
+        http2_flag = bool(getattr(settings, "http2", True))
+        try:
+            _HTTPX_CLIENT = httpx.AsyncClient(
+                http2=http2_flag,
+                limits=limits,
+            )
+        except ImportError:
+            # If http2 extras not installed, gracefully fall back to HTTP/1.1
+            _HTTPX_CLIENT = httpx.AsyncClient(
+                http2=False,
+                limits=limits,
+            )
+    return _HTTPX_CLIENT
 _RECENT = deque(maxlen=64)
 
 
@@ -97,6 +124,83 @@ def _anthropic_error_for_status(status: int, message: str) -> Dict[str, Any]:
 
 # simple in-memory cache for model resolution
 _MODEL_RESOLVE_CACHE: Dict[str, str] = {}
+# Cache for provider model ids to avoid frequent /v1/models calls
+_MODEL_LIST_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_MODEL_CACHE_LOCK = asyncio.Lock()
+
+
+def _models_cache_key(headers: Dict[str, str]) -> str:
+    # Keyed by base_url and a light fingerprint of auth headers
+    auth = headers.get("Authorization") or headers.get("x-api-key") or settings.chutes_api_key or ""
+    # avoid storing secrets; just length and last 6 chars as a weak fingerprint
+    sig = f"len:{len(auth)}:{auth[-6:] if auth else ''}"
+    return f"{settings.chutes_base_url.rstrip('/')}//{sig}"
+
+
+async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
+    key = _models_cache_key(headers)
+    now = asyncio.get_event_loop().time()
+    ttl = max(5, int(getattr(settings, "model_discovery_ttl", 300)))
+    # In-memory cache first
+    if key in _MODEL_LIST_CACHE:
+        ts, ids = _MODEL_LIST_CACHE[key]
+        if now - ts < ttl:
+            return ids
+    # Persistent cache (disk) second
+    if settings.model_discovery_persist:
+        try:
+            # Load JSON file and pick current key
+            if os.path.exists(settings.model_cache_file):
+                with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                ent = (obj or {}).get(key)
+                if ent and isinstance(ent.get("ids"), list):
+                    ids = [str(x) for x in ent.get("ids")]
+                    # Populate in-memory cache to avoid future file I/O
+                    _MODEL_LIST_CACHE[key] = (now, ids)
+                    return ids
+        except Exception:
+            ...
+    url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
+    client = _get_httpx_client()
+    try:
+        resp = await client.get(url, headers=headers, timeout=httpx.Timeout(30.0))
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    items: List[Any] = []
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            items = data["data"]
+        elif isinstance(data.get("models"), list):
+            items = data["models"]
+    ids: List[str] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("id"):
+            ids.append(str(it["id"]))
+        elif isinstance(it, str):
+            ids.append(it)
+    _MODEL_LIST_CACHE[key] = (now, ids)
+    # Persist to disk
+    if settings.model_discovery_persist:
+        try:
+            os.makedirs(os.path.dirname(settings.model_cache_file), exist_ok=True)
+            async with _MODEL_CACHE_LOCK:
+                obj: Dict[str, Any] = {}
+                if os.path.exists(settings.model_cache_file):
+                    try:
+                        with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                            obj = json.load(f) or {}
+                    except Exception:
+                        obj = {}
+                obj[key] = {"ids": ids, "ts": int(now), "base_url": settings.chutes_base_url}
+                with open(settings.model_cache_file, "w", encoding="utf-8") as f:
+                    json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            ...
+    return ids
 
 
 async def _try_resolve_model(
@@ -105,31 +209,7 @@ async def _try_resolve_model(
     # Use cache first
     if requested_model in _MODEL_RESOLVE_CACHE:
         return _MODEL_RESOLVE_CACHE[requested_model]
-    url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-        except Exception:
-            return None
-    if resp.status_code >= 400:
-        return None
-    try:
-        data = resp.json()
-    except Exception:
-        return None
-    items = []
-    if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            items = data["data"]
-        elif isinstance(data.get("models"), list):
-            items = data["models"]
-    # collect ids
-    ids = []
-    for it in items:
-        if isinstance(it, dict) and it.get("id"):
-            ids.append(it["id"])
-        elif isinstance(it, str):
-            ids.append(it)
+    ids = await _get_model_ids(headers) or []
     # exact match only (preserve case)
     if requested_model in ids:
         _MODEL_RESOLVE_CACHE[requested_model] = requested_model
@@ -187,30 +267,9 @@ async def _resolve_case_variant(
         s = re.sub(r"-\s*\d+\s*[kK]$", "", s)
         return s
 
-    url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-        except Exception:
-            return None
-    if resp.status_code >= 400:
+    ids = await _get_model_ids(headers)
+    if not ids:
         return None
-    try:
-        data = resp.json()
-    except Exception:
-        return None
-    items = []
-    if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            items = data["data"]
-        elif isinstance(data.get("models"), list):
-            items = data["models"]
-    ids = []
-    for it in items:
-        if isinstance(it, dict) and it.get("id"):
-            ids.append(it["id"])
-        elif isinstance(it, str):
-            ids.append(it)
     # 1) exact match
     if requested_model in ids:
         return requested_model
@@ -291,13 +350,16 @@ async def messages(
                 pass
         # Record resolved model (for /_debug/last), without logging sensitive payloads
         _rec["resolved_model"] = oai_payload.get("model")
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            try:
-                resp = await client.post(
-                    chutes_url, json=oai_payload, headers=_auth_headers(x_api_key, authorization)
-                )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+        client = _get_httpx_client()
+        try:
+            resp = await client.post(
+                chutes_url,
+                json=oai_payload,
+                headers=_auth_headers(x_api_key, authorization),
+                timeout=httpx.Timeout(120.0),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
         if resp.status_code >= 400:
             # Limited backoff/retry on 429 if configured
@@ -309,7 +371,12 @@ async def messages(
                 if 0.0 < ra <= settings.max_retry_after_seconds:
                     await asyncio.sleep(ra)
                     try:
-                        resp = await client.post(chutes_url, json=oai_payload, headers=_auth_headers(x_api_key, authorization))
+                        resp = await client.post(
+                            chutes_url,
+                            json=oai_payload,
+                            headers=_auth_headers(x_api_key, authorization),
+                            timeout=httpx.Timeout(120.0),
+                        )
                     except Exception:
                         ...
 
@@ -389,7 +456,8 @@ async def messages(
         # Open connection to Chutes
         model_to_use = oai_payload.get("model")
         headers0 = _auth_headers(x_api_key, authorization)
-        if settings.auto_fix_model_case and model_to_use:
+        # Avoid pre-flight discovery unless explicitly enabled; rely on 404 retry instead
+        if settings.auto_fix_model_case and settings.auto_fix_model_case_preflight and model_to_use:
             try:
                 resolved_model = await _resolve_case_variant(model_to_use, headers0)
                 if not resolved_model:
@@ -410,78 +478,84 @@ async def messages(
                 print("[proxy] upstream payload (stream):", json.dumps({"url": chutes_url, **{k: v for k, v in stream_payload.items() if k != "messages"}, "model": model_to_use}))
             except Exception:
                 pass
-        async with httpx.AsyncClient(timeout=None) as client:
-            try:
-                async with client.stream(
-                    "POST",
-                    chutes_url,
-                    json={**stream_payload, "model": model_to_use},
-                    headers={**headers0, "Accept": "text/event-stream"},
-                ) as upstream:
-                    _rec["phase"] = f"stream_status_{upstream.status_code}"
-                    # Anthropic stream scaffold
-                    final_text: list[str] = []
-                    sent_start = False
-                    model_name = None
-                    usage_input = 0
-                    usage_output = 0
+        client = _get_httpx_client()
 
-                    # Content block management
-                    next_block_index = 0
-                    text_block_index: int | None = None
-                    tool_states: Dict[int, Dict[str, Any]] = {}
+        async def _open_stream(payload_model: str):
+            return await client.stream(
+                "POST",
+                chutes_url,
+                json={**stream_payload, "model": payload_model},
+                headers={**headers0, "Accept": "text/event-stream"},
+                timeout=None,
+            )
 
-                    def ensure_message_start():
-                        nonlocal sent_start
-                        if not sent_start:
-                            msg = {
-                                "id": f"msg_{uuid.uuid4().hex}",
-                                "type": "message",
-                                "role": "assistant",
-                                # Outward-facing: always echo the originally requested casing
-                                "model": display_model or model_name or stream_payload.get("model", "unknown-model"),
-                                "content": [{"type": "text", "text": ""}],
-                            }
-                            sent_start = True
-                            return sse("message_start", {"type": "message_start", "message": msg})
-                        return None
+        try:
+            upstream_cm = await _open_stream(model_to_use)
+            async with upstream_cm as upstream:
+                _rec["phase"] = f"stream_status_{upstream.status_code}"
+                # Anthropic stream scaffold
+                final_text: list[str] = []
+                sent_start = False
+                model_name = None
+                usage_input = 0
+                usage_output = 0
 
-                    # Prepare sglang FunctionCallParser if tools exist
-                    parser = None
-                    parser_name = choose_tool_call_parser(model_to_use)
-                    if (stream_payload.get("tools")):
-                        try:
-                            from sglang.srt.function_call.function_call_parser import FunctionCallParser as _FCP
+                # Content block management
+                next_block_index = 0
+                text_block_index: int | None = None
+                tool_states: Dict[int, Dict[str, Any]] = {}
 
-                            class _Fn:
-                                def __init__(self, name: str, parameters: Dict[str, Any], strict: bool = False):
-                                    self.name = name
-                                    self.parameters = parameters
-                                    self.strict = strict
+                def ensure_message_start():
+                    nonlocal sent_start
+                    if not sent_start:
+                        msg = {
+                            "id": f"msg_{uuid.uuid4().hex}",
+                            "type": "message",
+                            "role": "assistant",
+                            # Outward-facing: always echo the originally requested casing
+                            "model": display_model or model_name or stream_payload.get("model", "unknown-model"),
+                            "content": [{"type": "text", "text": ""}],
+                        }
+                        sent_start = True
+                        return sse("message_start", {"type": "message_start", "message": msg})
+                    return None
 
-                            class _Tool:
-                                def __init__(self, fn: _Fn):
-                                    self.function = fn
+                # Prepare sglang FunctionCallParser if tools exist and enabled
+                parser = None
+                parser_name = choose_tool_call_parser(model_to_use)
+                if (stream_payload.get("tools")) and settings.enable_stream_tool_parser:
+                    try:
+                        from sglang.srt.function_call.function_call_parser import FunctionCallParser as _FCP
 
-                            _tool_objs = []
-                            for t in stream_payload.get("tools") or []:
-                                fn = (t or {}).get("function") or {}
-                                name = fn.get("name") or ""
-                                params = fn.get("parameters") or {}
-                                strict = bool(fn.get("strict", False))
-                                if name:
-                                    _tool_objs.append(_Tool(_Fn(name, params, strict)))
-                            if _tool_objs:
-                                parser = _FCP(_tool_objs, parser_name)
-                        except Exception:
-                            parser = None
+                        class _Fn:
+                            def __init__(self, name: str, parameters: Dict[str, Any], strict: bool = False):
+                                self.name = name
+                                self.parameters = parameters
+                                self.strict = strict
 
-                    # Rely solely on sglang parser when available
+                        class _Tool:
+                            def __init__(self, fn: _Fn):
+                                self.function = fn
 
-                    # Buffer for Cloud Code MCP tool-call markup across stream chunks
-                    mcp_buf = ""
+                        _tool_objs = []
+                        for t in stream_payload.get("tools") or []:
+                            fn = (t or {}).get("function") or {}
+                            name = fn.get("name") or ""
+                            params = fn.get("parameters") or {}
+                            strict = bool(fn.get("strict", False))
+                            if name:
+                                _tool_objs.append(_Tool(_Fn(name, params, strict)))
+                        if _tool_objs:
+                            parser = _FCP(_tool_objs, parser_name)
+                    except Exception:
+                        parser = None
 
-                    async for line in upstream.aiter_lines():
+                # Rely solely on sglang parser when available
+
+                # Buffer for Cloud Code MCP tool-call markup across stream chunks
+                mcp_buf = ""
+
+                async for line in upstream.aiter_lines():
                         if not line:
                             continue
                         if not line.startswith("data:"):
@@ -765,13 +839,13 @@ async def messages(
                             _rec["phase"] = "stream_ok_finish"
                             _RECENT.append(_rec)
                             break
-            except Exception as e:
-                # Surface upstream error as Anthropic error (single event)
-                data = {"type": "error", "error": {"type": "upstream_error", "message": str(e)}}
-                yield f"event: error\n".encode() + f"data: {json.dumps(data)}\n\n".encode()
-                _rec["phase"] = "stream_exception"
-                _rec["message"] = str(e)
-                _RECENT.append(_rec)
+        except Exception as e:
+            # Surface upstream error as Anthropic error (single event)
+            data = {"type": "error", "error": {"type": "upstream_error", "message": str(e)}}
+            yield f"event: error\n".encode() + f"data: {json.dumps(data)}\n\n".encode()
+            _rec["phase"] = "stream_exception"
+            _rec["message"] = str(e)
+            _RECENT.append(_rec)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -787,11 +861,11 @@ async def list_models(
     authorization: str | None = Header(default=None, alias="authorization"),
 ):
     url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        try:
-            resp = await client.get(url, headers=_auth_headers(x_api_key, authorization))
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+    client = _get_httpx_client()
+    try:
+        resp = await client.get(url, headers=_auth_headers(x_api_key, authorization), timeout=httpx.Timeout(60.0))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
     if resp.status_code >= 400:
         try:
             data = resp.json()
@@ -809,4 +883,87 @@ async def debug_last():
 
 @app.on_event("startup")
 async def _startup_noop():
+    # Initialize shared HTTP client eagerly to establish pools
+    _ = _get_httpx_client()
     return None
+
+
+@app.on_event("shutdown")
+async def _shutdown_close_client():
+    global _HTTPX_CLIENT
+    if _HTTPX_CLIENT is not None:
+        try:
+            await _HTTPX_CLIENT.aclose()
+        except Exception:
+            ...
+        _HTTPX_CLIENT = None
+
+
+# Admin: view current models cache entry (for this upstream + auth fingerprint)
+@app.get("/_models_cache")
+async def get_models_cache(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None, alias="authorization"),
+):
+    headers = _auth_headers(x_api_key, authorization)
+    key = _models_cache_key(headers)
+    now = asyncio.get_event_loop().time()
+    # in-memory
+    ent: Dict[str, Any] = {}
+    if key in _MODEL_LIST_CACHE:
+        ts, ids = _MODEL_LIST_CACHE[key]
+        ent = {"ids": ids, "ts": int(ts), "source": "memory"}
+    # disk
+    if settings.model_discovery_persist and os.path.exists(settings.model_cache_file):
+        try:
+            with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                obj = json.load(f) or {}
+            dent = obj.get(key)
+            if dent:
+                ent = {**dent, "source": dent.get("source") or ent.get("source") or "disk"}
+        except Exception:
+            ...
+    ent.setdefault("base_url", settings.chutes_base_url)
+    ent.setdefault("now", int(now))
+    ent.setdefault("key", key)
+    return ent
+
+
+# Admin: force refresh models and persist
+@app.post("/_models_cache/refresh")
+async def refresh_models_cache(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None, alias="authorization"),
+):
+    headers = _auth_headers(x_api_key, authorization)
+    ids = await _get_model_ids(headers)
+    if not ids:
+        raise HTTPException(status_code=502, detail="Failed to fetch models from upstream")
+    return {"ok": True, "count": len(ids)}
+
+
+# Admin: clear models cache entry
+@app.delete("/_models_cache")
+async def clear_models_cache(
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    authorization: str | None = Header(default=None, alias="authorization"),
+):
+    headers = _auth_headers(x_api_key, authorization)
+    key = _models_cache_key(headers)
+    removed = False
+    if key in _MODEL_LIST_CACHE:
+        _MODEL_LIST_CACHE.pop(key, None)
+        removed = True
+    if settings.model_discovery_persist and os.path.exists(settings.model_cache_file):
+        try:
+            async with _MODEL_CACHE_LOCK:
+                with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                    obj = json.load(f) or {}
+                if key in obj:
+                    obj.pop(key)
+                    removed = True
+                with open(settings.model_cache_file, "w", encoding="utf-8") as f:
+                    json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            ...
+    return {"ok": True, "removed": removed}
