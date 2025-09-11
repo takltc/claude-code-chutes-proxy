@@ -96,6 +96,7 @@ Body example:
 - Images and multimodal: request-side user/system image blocks are translated to OpenAI `image_url` content entries (non-streaming). Assistant image outputs are not mapped back (rare in OpenAI response).
 - Streaming emits Anthropic-style SSE events for text deltas. Token usage is reported at end when available from backend.
 - If your Chutes backend already exposes OpenAI-compatible endpoints (e.g. vLLM/SGLang templates), you can point `CHUTES_BASE_URL` directly to that service.
+ - Tool-call parsing: the proxy auto-selects an sglang parser per model family (LLaMA/Qwen/Mistral/DeepSeek/Kimi/GLM/GPT‑OSS). Models whose id contains `longcat` are parsed with the GPT‑OSS style detector, matching sglang’s approach.
 
 Environment Configuration
 

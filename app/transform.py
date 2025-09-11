@@ -259,6 +259,11 @@ def choose_tool_call_parser(model_name: Optional[str]) -> str:
     s = (model_name or "").lower()
     if not s:
         return "pythonic"
+    # Longcat models frequently adopt T4/GPT‑OSS style tool-call channels
+    # e.g., <|channel|>commentary to=functions.xxx<|constrain|>json<|message|>{...}<|call|>
+    # Map them to the sglang "gpt-oss" detector.
+    if "longcat" in s:
+        return "gpt-oss"
     if "llama-3" in s or "llama3" in s:
         return "llama3"
     if "qwen3" in s:

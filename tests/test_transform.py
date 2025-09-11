@@ -145,6 +145,7 @@ def test_choose_parser_heuristics():
     assert choose_tool_call_parser("Mistral-Small-24B") == "mistral"
     assert choose_tool_call_parser("deepseek-v3.1") == "deepseekv31"
     assert choose_tool_call_parser("glm-4.5") == "glm45"
+    assert choose_tool_call_parser("longcat/Longcat-Flash-8B") == "gpt-oss"
 
 
 def test_stream_chunk_tool_parse_pythonic():
