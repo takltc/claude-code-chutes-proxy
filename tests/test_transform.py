@@ -183,3 +183,91 @@ def test_stream_chunk_tool_parse_unknown_markup():
     text = "A <tool_call_textual>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call_textual> B"
     normal, calls = parse_stream_tools_text(text, tools, model_name="unknown-model")
     assert (any(call.get("name") == "get_weather" for call in calls)) or ("<tool_call_textual>" in normal)
+
+
+def test_deepseek_v31_prompt_formatting():
+    """Test DeepSeek V3.1 prompt formatting functions."""
+    from app.transform import format_deepseek_v31_prompt, format_deepseek_v31_tool_call_prompt
+    
+    # Test non-thinking mode prefix
+    prefix = format_deepseek_v31_prompt("You are a helpful assistant.", "Hello, how are you?")
+    assert prefix == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Hello, how are you?<｜Assistant｜></tool_call>"
+    
+    # Test thinking mode prefix
+    thinking_prefix = format_deepseek_v31_prompt("You are a helpful assistant.", "Think step by step.", is_thinking=True)
+    assert thinking_prefix == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Think step by step.<｜Assistant｜><tool_call>"
+    
+    # Test with context
+    context = "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What's the weather?<｜Assistant｜><tool_call>The weather is sunny.<｜end▁of▁sentence｜>"
+    with_context = format_deepseek_v31_prompt("You are a helpful assistant.", "What about tomorrow?", context=context)
+    assert with_context == context + "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What about tomorrow?<｜Assistant｜></tool_call>"
+    
+    # Test tool call prompt formatting
+    tool_desc = "## Tools\nYou have access to the following tools:\n\n### get_weather\nDescription: Get weather information\nParameters: {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}"
+    tool_prompt = format_deepseek_v31_tool_call_prompt("You are a helpful assistant.", tool_desc, "What's the weather in SF?")
+    expected = "<｜begin▁of▁sentence｜>You are a helpful assistant.\n\n" + tool_desc + "<｜User｜>What's the weather in SF?<｜Assistant｜></tool_call>"
+    assert tool_prompt == expected
+
+
+def test_deepseek_v31_tool_call_payload():
+    """Test DeepSeek V3.1 tool call payload formatting."""
+    from app.transform import format_deepseek_v31_tool_call_payload
+    
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather information",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    },
+                    "required": ["city"]
+                }
+            }
+        }
+    ]
+    
+    result = format_deepseek_v31_tool_call_payload("You are a helpful assistant.", tools, "What's the weather in SF?")
+    assert "prompt" in result
+    assert "tool_description" in result
+    assert "<｜begin▁of▁sentence｜>You are a helpful assistant." in result["prompt"]
+    assert "## Tools" in result["tool_description"]
+    assert "get_weather" in result["tool_description"]
+    assert "<｜User｜>What's the weather in SF?<｜Assistant｜></tool_call>" in result["prompt"]
+
+
+def test_deepseek_v31_tool_call_parsing():
+    """Test DeepSeek V3.1 tool call markup parsing."""
+    from app.transform import parse_deepseek_v31_tool_markup
+    
+    # Test parsing DeepSeek V3.1 tool call markup
+    text = "Some text <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"SF\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜> more text"
+    remaining_text, tool_calls = parse_deepseek_v31_tool_markup(text)
+    
+    assert "Some text" in remaining_text
+    assert "more text" in remaining_text
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["name"] == "get_weather"
+    assert tool_calls[0]["input"] == {"city": "SF"}
+    
+    # Test with multiple tool calls
+    text2 = "Text <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"SF\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_time<｜tool▁sep｜>{\"timezone\": \"PST\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜> end"
+    remaining_text2, tool_calls2 = parse_deepseek_v31_tool_markup(text2)
+    
+    assert "Text" in remaining_text2
+    assert "end" in remaining_text2
+    assert len(tool_calls2) == 2
+    assert tool_calls2[0]["name"] == "get_weather"
+    assert tool_calls2[0]["input"] == {"city": "SF"}
+    assert tool_calls2[1]["name"] == "get_time"
+    assert tool_calls2[1]["input"] == {"timezone": "PST"}
+    
+    # Test with no tool calls
+    text3 = "Just plain text without tool calls"
+    remaining_text3, tool_calls3 = parse_deepseek_v31_tool_markup(text3)
+    
+    assert remaining_text3 == text3
+    assert len(tool_calls3) == 0

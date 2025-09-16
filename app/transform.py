@@ -186,6 +186,28 @@ def anthropic_to_openai_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def format_deepseek_v31_tool_call_payload(system_prompt: str, tools: List[Dict[str, Any]], query: str) -> Dict[str, Any]:
+    """
+    Format the payload for DeepSeek V3.1 tool calls according to the specified format.
+    
+    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>
+    """
+    # Build tool description according to the format
+    tool_description = "## Tools\nYou have access to the following tools:\n\n"
+    for tool in tools:
+        tool_description += f"### {tool.get('function', {}).get('name', '')}\n"
+        tool_description += f"Description: {tool.get('function', {}).get('description', '')}\n"
+        tool_description += f"Parameters: {json_dumps_safe(tool.get('function', {}).get('parameters', {}))}\n\n"
+    
+    # Format the prompt according to DeepSeek V3.1 requirements
+    formatted_prompt = f"<｜begin▁of▁sentence｜>{system_prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>"
+    
+    return {
+        "prompt": formatted_prompt,
+        "tool_description": tool_description
+    }
+
+
 ## Removed custom model capability adaptation. OpenAI-side behavior is determined by sglang/OpenAI schema.
 
 
@@ -288,6 +310,116 @@ def choose_tool_call_parser(model_name: Optional[str]) -> str:
     return "pythonic"
 
 
+def format_deepseek_v31_prompt(system_prompt: str, user_query: str, context: str = "", is_thinking: bool = False) -> str:
+    """
+    Format prompt according to DeepSeek V3.1 requirements.
+    
+    Non-thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></tool_call>
+    Non-thinking mode context: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></tool_call>{response}<｜end▁of▁sentence｜>...<｜User｜>{query}<｜Assistant｜></tool_call>{response}<｜end▁of▁sentence｜>
+    
+    Thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜><tool_call>
+    """
+    if is_thinking:
+        # Thinking mode uses 🎤 token
+        prefix = f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜><tool_call>"
+    else:
+        # Non-thinking mode uses 🎦 token
+        prefix = f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜></tool_call>"
+    
+    if context:
+        # Append context to prefix
+        return context + prefix
+    return prefix
+
+
+def format_deepseek_v31_tool_call_prompt(system_prompt: str, tool_description: str, user_query: str) -> str:
+    """
+    Format tool call prompt according to DeepSeek V3.1 requirements.
+    
+    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>
+    """
+    return f"<｜begin▁of▁sentence｜>{system_prompt}\n\n{tool_description}<｜User｜>{user_query}<｜Assistant｜></tool_call>"
+
+
+
+def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]]:
+    """Parse DeepSeek V3.1 tool-call markup into structured tool_use blocks.
+    
+    Recognizes sections of the form:
+      <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{"key": "value"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+    
+    Returns (remaining_text_without_markup, tool_use_blocks)
+    """
+    if not text:
+        return text, []
+    
+    # Normalize fullwidth characters and special glyphs
+    try:
+        normalized_text = text.replace("｜", "|").replace("▁", "_")
+    except Exception:
+        normalized_text = text
+    
+    BEG = "<|tool_calls_begin|>"
+    END = "<|tool_calls_end|>"
+    CALL_BEG = "<|tool_call_begin|>"
+    CALL_END = "<|tool_call_end|>"
+    SEP = "<|tool_sep|>"
+    
+    out_text_parts: list[str] = []
+    calls: list[Dict[str, Any]] = []
+    pos = 0
+    n = len(normalized_text)
+    
+    while pos < n:
+        i = normalized_text.find(BEG, pos)
+        if i == -1:
+            out_text_parts.append(normalized_text[pos:])
+            break
+        # text before the section
+        out_text_parts.append(normalized_text[pos:i])
+        j = normalized_text.find(END, i)
+        if j == -1:
+            # No closing tag; keep as plain text
+            out_text_parts.append(normalized_text[i:])
+            break
+        
+        section = normalized_text[i + len(BEG):j]
+        call_pos = 0
+        call_n = len(section)
+        
+        while call_pos < call_n:
+            call_i = section.find(CALL_BEG, call_pos)
+            if call_i == -1:
+                break
+            call_j = section.find(CALL_END, call_i)
+            if call_j == -1:
+                break
+            
+            call_content = section[call_i + len(CALL_BEG):call_j]
+            sep_idx = call_content.find(SEP)
+            if sep_idx != -1:
+                name = call_content[:sep_idx].strip()
+                args_raw = call_content[sep_idx + len(SEP):].strip()
+                try:
+                    args = json_loads_safe(args_raw)
+                except Exception:
+                    args = {}
+                calls.append(
+                    {
+                        "type": "tool_use",
+                        "id": f"call_{uuid.uuid4().hex}",
+                        "name": name,
+                        "input": args if isinstance(args, dict) else {},
+                    }
+                )
+            call_pos = call_j + len(CALL_END)
+        
+        # Skip the whole section in output text
+        pos = j + len(END)
+    
+    return "".join(out_text_parts), calls
+
+
 def openai_to_anthropic_response(
     oai: Dict[str, Any],
     requested_model: Optional[str] = None,
@@ -366,6 +498,37 @@ def openai_to_anthropic_response(
             ...
 
     try:
+        def _map_name(n: Optional[str]) -> str:
+            try:
+                raw = (n or "").strip()
+                mapped = settings.map_tool_name(requested_model or oai.get("model"), raw)
+                out = (mapped or raw) if isinstance(mapped, str) else raw
+                # Common synonyms (case-insensitive)
+                synonyms = {
+                    "grep": "grep",
+                    "glob": "glob_file_search",
+                    "globfiles": "glob_file_search",
+                    "todowrite": "todo_write",
+                    "todo": "todo_write",
+                    "bash": "run_terminal_cmd",
+                    "shell": "run_terminal_cmd",
+                    "run": "run_terminal_cmd",
+                    "runcmd": "run_terminal_cmd",
+                    "runcmds": "run_terminal_cmd",
+                    "runcommand": "run_terminal_cmd",
+                    "terminal": "run_terminal_cmd",
+                    "sh": "run_terminal_cmd",
+                }
+                out = synonyms.get(out) or synonyms.get(out.lower()) or out
+                if out == raw and out and (any(ch.isupper() for ch in out) and "_" not in out):
+                    import re as _re
+                    s1 = _re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", out)
+                    s2 = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
+                    out = s2.lower()
+                return out
+            except Exception:
+                return n or ""
+
         first_choice = (oai.get("choices") or [{}])[0]
         message = first_choice.get("message") or {}
         text = message.get("content") or ""
@@ -390,17 +553,36 @@ def openai_to_anthropic_response(
                 {
                     "type": "tool_use",
                     "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
-                    "name": (tc.get("function") or {}).get("name"),
+                    "name": _map_name((tc.get("function") or {}).get("name")),
                     "input": args,
                 }
             )
         # Parse Cloud Code MCP tool-call markup first
         if text:
             text, markup_calls = parse_mcp_tool_markup(text)
+            # apply tool name mapping
+            for c in markup_calls or []:
+                try:
+                    c["name"] = _map_name(c.get("name"))
+                except Exception:
+                    ...
             tool_calls_block.extend(markup_calls)
+            # Parse DeepSeek V3.1 tool-call markup
+            text, deepseek_calls = parse_deepseek_v31_tool_markup(text)
+            for c in deepseek_calls or []:
+                try:
+                    c["name"] = _map_name(c.get("name"))
+                except Exception:
+                    ...
+            tool_calls_block.extend(deepseek_calls)
         # Fallback: use sglang parser on textual content when no structured tool_calls
         if not tcalls and text:
             text, parsed_calls = _maybe_parse_tools_with_sglang(text)
+            for c in parsed_calls or []:
+                try:
+                    c["name"] = _map_name(c.get("name"))
+                except Exception:
+                    ...
             tool_calls_block.extend(parsed_calls)
     except Exception:
         text = ""

@@ -656,6 +656,139 @@ async def messages(
             upstream_cm = _open_stream(model_to_use)
             async with upstream_cm as upstream:
                 _rec["phase"] = f"stream_status_{upstream.status_code}"
+                # If upstream returns an error status, emit an SSE error event and stop
+                if upstream.status_code >= 400:
+                    try:
+                        body_bytes = await upstream.aread()
+                        body_text = body_bytes.decode("utf-8", errors="ignore") if body_bytes is not None else ""
+                        try:
+                            j = json.loads(body_text) if body_text else {}
+                            message = (j.get("error") or {}).get("message") or j.get("message") or (json.dumps(j, ensure_ascii=False) if j else "")
+                        except Exception:
+                            message = body_text
+                    except Exception:
+                        message = f"Upstream returned HTTP {upstream.status_code} without body"
+                    try:
+                        err_env = _anthropic_error_for_status(upstream.status_code, message or "")
+                        etype = (err_env.get("error") or {}).get("type") or "api_error"
+                    except Exception:
+                        etype = "api_error"
+                    yield sse("error", {"type": "error", "error": {"type": etype, "message": message or "Upstream error"}})
+                    _rec["phase"] = "stream_error_status"
+                    _rec["upstream_status"] = upstream.status_code
+                    _rec["message"] = message
+                    _RECENT.append(_rec)
+                    return
+
+                # If upstream did not return SSE content-type, try to fallback by mapping the JSON body to SSE
+                ct = upstream.headers.get("content-type") or upstream.headers.get("Content-Type") or ""
+                if "text/event-stream" not in str(ct).lower():
+                    try:
+                        raw = await upstream.aread()
+                        txt = raw.decode("utf-8", errors="ignore") if raw is not None else ""
+                        data_obj = json.loads(txt) if txt else {}
+                    except Exception:
+                        data_obj = {}
+                    if not data_obj:
+                        yield sse("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream returned no SSE and empty body"}})
+                        _rec["phase"] = "stream_fallback_empty_body"
+                        _RECENT.append(_rec)
+                        return
+                    anth = openai_to_anthropic_response(
+                        data_obj,
+                        requested_model=display_model,
+                        tools=stream_payload.get("tools"),
+                        tool_call_parser=choose_tool_call_parser(model_to_use),
+                    )
+                    ms = ensure_message_start()
+                    if ms:
+                        yield ms
+                    # Emit content blocks reconstructed from non-stream response
+                    for blk in (anth.get("content") or []):
+                        btype = blk.get("type")
+                        if btype == "thinking":
+                            cb_index = next_block_index
+                            next_block_index += 1
+                            yield sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": cb_index,
+                                    "content_block": {"type": "thinking", "thinking": ""},
+                                },
+                            )
+                            yield sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": cb_index,
+                                    "delta": {"type": "thinking_delta", "thinking": blk.get("thinking", "")},
+                                },
+                            )
+                            yield sse("content_block_stop", {"type": "content_block_stop", "index": cb_index})
+                        elif btype == "text":
+                            ts = ensure_text_block()
+                            if ts:
+                                yield ts
+                            yield sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_index,
+                                    "delta": {"type": "text_delta", "text": blk.get("text", "")},
+                                },
+                            )
+                        elif btype == "tool_use":
+                            cb_index = next_block_index
+                            next_block_index += 1
+                            tid = blk.get("id") or f"call_{uuid.uuid4().hex}"
+                            tname = blk.get("name") or ""
+                            tinput = blk.get("input") or {}
+                            yield sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": cb_index,
+                                    "content_block": {"type": "tool_use", "id": tid, "name": tname, "input": {}},
+                                },
+                            )
+                            try:
+                                args_str = json.dumps(tinput, ensure_ascii=False)
+                            except Exception:
+                                args_str = "{}"
+                            yield sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": cb_index,
+                                    "delta": {"type": "input_json_delta", "partial_json": args_str},
+                                },
+                            )
+                            yield sse("content_block_stop", {"type": "content_block_stop", "index": cb_index})
+                            emitted_tool_use = True
+                    if text_block_index is not None:
+                        yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                        text_block_index = None
+                    usage_obj = anth.get("usage") or {}
+                    stop_reason = anth.get("stop_reason") or ("tool_use" if emitted_tool_use else "end_turn")
+                    yield sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                            "usage": {
+                                "input_tokens": int(usage_obj.get("input_tokens") or 0),
+                                "output_tokens": int(usage_obj.get("output_tokens") or 0),
+                            },
+                        },
+                    )
+                    yield sse("message_stop", {"type": "message_stop"})
+                    _rec["phase"] = "stream_fallback_non_sse"
+                    _RECENT.append(_rec)
+                    return
+
+                # Guard: if no chunks are received at all, emit an error event instead of silently ending
+                no_chunks = True
                 # Anthropic stream scaffold
                 final_text: list[str] = []
                 sent_start = False
@@ -750,6 +883,201 @@ async def messages(
                     except Exception:
                         ...
 
+                # Normalize a raw tool name to the best matching declared tool
+                def _normalize_tool_name(raw_name: Optional[str]) -> str:
+                    try:
+                        name_in = (raw_name or "").strip()
+                        if not name_in:
+                            return ""
+                        # Common synonyms fallback
+                        synonyms = {
+                            "grep": "grep",
+                            "glob": "glob_file_search",
+                            "globfiles": "glob_file_search",
+                            "todowrite": "todo_write",
+                            "todo": "todo_write",
+                            "bash": "run_terminal_cmd",
+                            "shell": "run_terminal_cmd",
+                            "run": "run_terminal_cmd",
+                            "runcmd": "run_terminal_cmd",
+                            "runcmds": "run_terminal_cmd",
+                            "runcommand": "run_terminal_cmd",
+                            "terminal": "run_terminal_cmd",
+                            "sh": "run_terminal_cmd",
+                        }
+                        name_in = synonyms.get(name_in) or synonyms.get(name_in.lower()) or name_in
+                        # 1) exact match against declared
+                        if name_in in known_tools:
+                            return name_in
+                        # 2) case-insensitive match against declared
+                        low = name_in.lower()
+                        for kt in known_tools:
+                            try:
+                                if str(kt).lower() == low:
+                                    return kt
+                            except Exception:
+                                ...
+                        # 3) env-configured mapping
+                        try:
+                            mapped = settings.map_tool_name(model_to_use, name_in)
+                        except Exception:
+                            mapped = name_in
+                        mapped = mapped or name_in
+                        if isinstance(mapped, str):
+                            mlow = mapped.strip().lower()
+                            for kt in known_tools:
+                                try:
+                                    if str(kt).lower() == mlow:
+                                        return kt
+                                except Exception:
+                                    ...
+                        # 4) fuzzy to declared: compare alnum-only lowercase forms and containment
+                        import re as _re
+                        def _norm(s: str) -> str:
+                            return _re.sub(r"[^a-z0-9]", "", s.lower())
+                        n_in = _norm(name_in)
+                        best = None
+                        best_score = -1
+                        for kt in known_tools:
+                            try:
+                                n_kt = _norm(str(kt))
+                                score = 0
+                                if n_kt == n_in:
+                                    score = 100
+                                elif n_in and n_in in n_kt:
+                                    score = 80 - max(0, len(n_kt) - len(n_in))
+                                elif n_kt and n_kt in n_in:
+                                    score = 60 - max(0, len(n_in) - len(n_kt))
+                                if score > best_score:
+                                    best_score = score
+                                    best = kt
+                            except Exception:
+                                ...
+                        if best is not None and best_score >= 60:
+                            return best
+                        # 5) snake_case fallback for general normalization
+                        try:
+                            s1 = _re.sub(r"(.)([A-Z][a-z]+)", r"\\1_\\2", name_in)
+                            s2 = _re.sub(r"([a-z0-9])([A-Z])", r"\\1_\\2", s1)
+                            out = s2.replace(" ", "_").replace("-", "_").lower()
+                        except Exception:
+                            out = name_in
+                        # prefer any declared that equals this fallback (case-insensitive)
+                        low2 = (out or "").lower()
+                        for kt in known_tools:
+                            try:
+                                if str(kt).lower() == low2:
+                                    return kt
+                            except Exception:
+                                ...
+                        return out
+                    except Exception:
+                        return raw_name or ""
+
+                # Normalize tool input args to expected schema for known tools
+                def _normalize_tool_input(tool_name: Optional[str], args_obj: Any) -> Any:
+                    try:
+                        if not isinstance(args_obj, dict):
+                            return args_obj
+                        name = (_normalize_tool_name(tool_name) or "").lower()
+                        args = dict(args_obj)
+                        if name == "grep":
+                            # field aliases
+                            if "query" in args and "pattern" not in args:
+                                args["pattern"] = args.pop("query")
+                            if "regex" in args and "pattern" not in args:
+                                args["pattern"] = args.pop("regex")
+                            # path aliases
+                            for k in ("directory", "dir", "root", "file", "files"):
+                                if k in args and "path" not in args and isinstance(args.get(k), str):
+                                    args["path"] = args.pop(k)
+                                    break
+                            # glob aliases
+                            for k in ("glob_pattern", "globpattern", "globPath"):
+                                if k in args and "glob" not in args:
+                                    args["glob"] = args.pop(k)
+                                    break
+                            # boolean/flags
+                            if args.pop("-n", None) is not None:
+                                # tool doesn't support -n; ignore
+                                pass
+                            if "case_insensitive" in args and "-i" not in args:
+                                try:
+                                    args["-i"] = bool(args.pop("case_insensitive"))
+                                except Exception:
+                                    args.pop("case_insensitive", None)
+                            # output mode helpers
+                            if isinstance(args.get("count"), bool) and args.get("count"):
+                                args["output_mode"] = "count"
+                                args.pop("count", None)
+                            if isinstance(args.get("files_with_matches"), bool) and args.get("files_with_matches"):
+                                args["output_mode"] = "files_with_matches"
+                                args.pop("files_with_matches", None)
+                            # context mapping
+                            for s, d in (("before", "-B"), ("after", "-A"), ("context", "-C")):
+                                if s in args and d not in args:
+                                    try:
+                                        args[d] = int(args.pop(s))
+                                    except Exception:
+                                        args.pop(s, None)
+                            # limits & typing
+                            if "limit" in args and "head_limit" not in args:
+                                try:
+                                    args["head_limit"] = int(args.pop("limit"))
+                                except Exception:
+                                    args.pop("limit", None)
+                            if "multiline" in args:
+                                try:
+                                    args["multiline"] = bool(args["multiline"])
+                                except Exception:
+                                    args.pop("multiline", None)
+                            return args
+                        if name == "glob_file_search":
+                            if "pattern" in args and "glob_pattern" not in args:
+                                args["glob_pattern"] = args.pop("pattern")
+                            for k in ("dir", "directory", "root", "path"):
+                                if k in args and "target_directory" not in args and isinstance(args.get(k), str):
+                                    args["target_directory"] = args.pop(k)
+                                    break
+                            return args
+                        if name == "run_terminal_cmd":
+                            # default is_background to False
+                            if "is_background" not in args:
+                                bg_alias = args.pop("background", None)
+                                try:
+                                    args["is_background"] = bool(bg_alias) if bg_alias is not None else False
+                                except Exception:
+                                    args["is_background"] = False
+                            # cmd aliases
+                            if "command" not in args and "cmd" in args:
+                                args["command"] = args.pop("cmd")
+                            # join args array into command
+                            if "command" not in args and isinstance(args.get("args"), list):
+                                try:
+                                    args["command"] = " ".join(map(str, args.pop("args") or []))
+                                except Exception:
+                                    args.pop("args", None)
+                            # quote common glob patterns for find -name
+                            try:
+                                import re as _re
+                                cmd = str(args.get("command") or "")
+                                def _quote_name_pattern(m: "_re.Match[str]") -> str:
+                                    token = m.group(1)
+                                    if not token:
+                                        return m.group(0)
+                                    if ("*" in token or "?" in token or "[" in token) and not (token.startswith("\"") or token.startswith("'")):
+                                        return "-name '" + token + "'"
+                                    return m.group(0)
+                                cmd2 = _re.sub(r"-name\s+([^\s'\"][^\s]*)", _quote_name_pattern, cmd)
+                                if cmd2 != cmd:
+                                    args["command"] = cmd2
+                            except Exception:
+                                ...
+                            return args
+                        return args_obj
+                    except Exception:
+                        return args_obj
+
                 # Track a dedicated thinking block for reasoning deltas
                 thinking_block_index: Optional[int] = None
                 thinking_open = False
@@ -770,6 +1098,7 @@ async def messages(
                             continue
                         if not line.startswith("data:"):
                             continue
+                        no_chunks = False
                         payload_str = line[5:].strip()
                         if payload_str == "[DONE]":
                             # Close any open blocks
@@ -1090,7 +1419,7 @@ async def messages(
                                     cb_index = next_block_index
                                     next_block_index += 1
                                     call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
-                                    call_name = call.get("name") or "tool"
+                                    call_name = _normalize_tool_name(call.get("name")) or "tool"
                                     call_args = call.get("input") or {}
                                     yield sse(
                                         "content_block_start",
@@ -1304,7 +1633,7 @@ async def messages(
                                             "open": False,
                                             "cb_index": next_block_index,
                                             "id": call.get("id") or f"call_{uuid.uuid4().hex}",
-                                            "name": call.get("name") or "",
+                                            "name": _normalize_tool_name(call.get("name")) or "",
                                         }
                                         tool_states[st_key] = st
                                         cb_index = next_block_index
@@ -1347,13 +1676,14 @@ async def messages(
                                                 fargs = _json.loads(it.parameters) if isinstance(it.parameters, str) else {}
                                             except Exception:
                                                 fargs = {}
-                                            st = tool_states.get(it.name or f"idx_{len(tool_states)}")
+                                            mapped_name = _normalize_tool_name(it.name)
+                                            st = tool_states.get(mapped_name or f"idx_{len(tool_states)}")
                                             if not st:
-                                                st = tool_states[it.name or f"idx_{len(tool_states)}"] = {
+                                                st = tool_states[mapped_name or f"idx_{len(tool_states)}"] = {
                                                     "open": False,
                                                     "cb_index": next_block_index,
                                                     "id": f"call_{uuid.uuid4().hex}",
-                                                    "name": it.name or "",
+                                                    "name": mapped_name or "",
                                                 }
                                                 cb_index = next_block_index
                                                 next_block_index += 1
@@ -1444,7 +1774,8 @@ async def messages(
                                     st["id"] = tci.get("id")
                                 fname = (tci.get("function") or {}).get("name")
                                 if fname:
-                                    st["name"] = (st.get("name") or "") + fname if not st.get("name") else st["name"]
+                                    fname_m = _normalize_tool_name(fname)
+                                    st["name"] = (st.get("name") or "") + fname_m if not st.get("name") else st["name"]
                                 fargs = (tci.get("function") or {}).get("arguments")
                                 if fargs:
                                     st["args"] += fargs
@@ -1544,6 +1875,11 @@ async def messages(
                             _rec["phase"] = "stream_ok_finish"
                             _RECENT.append(_rec)
                             break
+                # After stream finishes, if no lines were received, surface an error to client
+                if no_chunks:
+                    yield sse("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream stream ended without sending any chunks"}})
+                    _rec["phase"] = "stream_empty_no_chunks"
+                    _RECENT.append(_rec)
         except Exception as e:
             # Surface upstream error as Anthropic error (single event)
             data = {"type": "error", "error": {"type": "upstream_error", "message": str(e)}}
@@ -1565,20 +1901,34 @@ async def list_models(
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
     authorization: str | None = Header(default=None, alias="authorization"),
 ):
-    url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
-    client = _get_httpx_client()
-    try:
-        resp = await client.get(url, headers=_auth_headers(x_api_key, authorization), timeout=httpx.Timeout(60.0))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-    if resp.status_code >= 400:
+    # Use cached model discovery to avoid frequent upstream calls
+    headers = _auth_headers(x_api_key, authorization)
+    model_ids = await _get_model_ids(headers)
+    
+    if model_ids is None:
+        # If cache miss and upstream fetch fails, try direct upstream call as fallback
+        url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
+        client = _get_httpx_client()
         try:
-            data = resp.json()
-            message = data.get("error", {}).get("message") or data.get("message") or json.dumps(data)
-        except Exception:
-            message = resp.text
-        return JSONResponse(status_code=resp.status_code, content=_anthropic_error_for_status(resp.status_code, message))
-    return JSONResponse(content=resp.json())
+            resp = await client.get(url, headers=headers, timeout=httpx.Timeout(60.0))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+        if resp.status_code >= 400:
+            try:
+                data = resp.json()
+                message = data.get("error", {}).get("message") or data.get("message") or json.dumps(data)
+            except Exception:
+                message = resp.text
+            return JSONResponse(status_code=resp.status_code, content=_anthropic_error_for_status(resp.status_code, message))
+        return JSONResponse(content=resp.json())
+    
+    # Format cached model ids to match upstream API response structure
+    models_data = [{"id": model_id, "object": "model", "created": 0, "owned_by": "chutes"} for model_id in model_ids]
+    response_data = {
+        "object": "list",
+        "data": models_data
+    }
+    return JSONResponse(content=response_data)
 
 
 @app.get("/_debug/last")
