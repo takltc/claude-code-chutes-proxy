@@ -505,19 +505,23 @@ def openai_to_anthropic_response(
                 out = (mapped or raw) if isinstance(mapped, str) else raw
                 # Common synonyms (case-insensitive)
                 synonyms = {
-                    "grep": "grep",
-                    "glob": "glob_file_search",
-                    "globfiles": "glob_file_search",
-                    "todowrite": "todo_write",
-                    "todo": "todo_write",
-                    "bash": "run_terminal_cmd",
-                    "shell": "run_terminal_cmd",
-                    "run": "run_terminal_cmd",
-                    "runcmd": "run_terminal_cmd",
-                    "runcmds": "run_terminal_cmd",
-                    "runcommand": "run_terminal_cmd",
-                    "terminal": "run_terminal_cmd",
-                    "sh": "run_terminal_cmd",
+                    "grep": "Grep",
+                    "glob": "Glob",
+                    "globfiles": "Glob",
+                    "todowrite": "TodoWrite",
+                    "todo": "TodoWrite",
+                    "bash": "Bash",
+                    "shell": "Bash",
+                    "run": "Bash",
+                    "runcmd": "Bash",
+                    "runcmds": "Bash",
+                    "runcommand": "Bash",
+                    "terminal": "Bash",
+                    "sh": "Bash",
+                    # Additional synonyms for better compatibility
+                    "run_terminal_cmd": "Bash",
+                    "glob_file_search": "Glob",
+                    "todo_write": "TodoWrite",
                 }
                 out = synonyms.get(out) or synonyms.get(out.lower()) or out
                 if out == raw and out and (any(ch.isupper() for ch in out) and "_" not in out):

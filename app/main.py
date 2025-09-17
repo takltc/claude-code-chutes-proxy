@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import uuid
 
@@ -335,9 +336,81 @@ async def _resolve_case_variant(
     mp = await _get_model_case_map(headers)
     if mp:
         # direct lowercase map
-        val = mp.get(requested_model.lower())
+        req_low = (requested_model or "").strip().lower()
+        val = mp.get(req_low)
         if val:
             return val
+        # Heuristic: provider canonical ids may include a vendor prefix, e.g. "anthropic/<id>".
+        # If the requested id lacks the prefix, try suffix-matching against known ids.
+        try:
+            # last segment after a vendor prefix (if any)
+            last = req_low.split("/", 1)[-1]
+            if last:
+                # Prefer an exact suffix match "*/<last>"
+                for lk, canon in mp.items():
+                    try:
+                        if isinstance(lk, str) and lk.endswith("/" + last):
+                            return canon
+                    except Exception:
+                        ...
+                # As a weaker fallback, accept exact key equality without prefix (when provider publishes plain ids)
+                for lk, canon in mp.items():
+                    try:
+                        if isinstance(lk, str) and lk == last:
+                            return canon
+                    except Exception:
+                        ...
+        except Exception:
+            ...
+
+    # As a broader fallback, consult full provider model list and perform fuzzy resolution
+    try:
+        ids = await _get_model_ids(headers) or []
+        if ids:
+            req_low = (requested_model or "").strip().lower()
+            last = req_low.split("/", 1)[-1]
+            # 1) Exact last-segment match against any canonical id's last segment
+            for canon in ids:
+                try:
+                    if not isinstance(canon, str):
+                        continue
+                    cl = canon.strip().lower()
+                    if cl.split("/", 1)[-1] == last:
+                        return canon
+                except Exception:
+                    ...
+            # 2) If request has a date suffix like -YYYYMMDD, drop it and try again
+            import re as _re
+            m = _re.search(r"^(.*?)-(\d{8})$", last)
+            base = m.group(1) if m else last
+            if base and base != last:
+                for canon in ids:
+                    try:
+                        if not isinstance(canon, str):
+                            continue
+                        cl = canon.strip().lower()
+                        if cl.split("/", 1)[-1] == base:
+                            return canon
+                        if cl.endswith("/" + base + "-latest"):
+                            return canon
+                        if cl.endswith("/" + base):
+                            return canon
+                    except Exception:
+                        ...
+            # 3) Prefix match (e.g., base-latest, base-2024xxxx)
+            if base:
+                for canon in ids:
+                    try:
+                        if not isinstance(canon, str):
+                            continue
+                        cl = canon.strip().lower()
+                        tail = cl.split("/", 1)[-1]
+                        if tail.startswith(base):
+                            return canon
+                    except Exception:
+                        ...
+    except Exception:
+        ...
     # Last-resort heuristic
     try:
         guessed = _guess_case_for_known_models(requested_model)
@@ -575,7 +648,7 @@ async def messages(
         ))
 
     # Streaming path
-    async def event_stream() -> AsyncIterator[bytes]:
+    async def event_stream(request: Request) -> AsyncIterator[bytes]:
         # Helper to format SSE (with optional debug printing)
         debug_sse = os.environ.get("DEBUG_SSE", "").lower() in ("1", "true", "yes", "on")
         req_id = uuid.uuid4().hex[:8]
@@ -621,6 +694,15 @@ async def messages(
         # Ensure upstream uses provider's canonical model id; keep outward display via display_model
         if model_to_use:
             stream_payload["model"] = model_to_use
+        else:
+            # If case-map couldn't resolve but auto-fix is enabled, try minimal fallback cleanup:
+            # strip vendor prefix and keep lowercase; upstream may still recognize the suffix-only id.
+            try:
+                raw = str(stream_payload.get("model") or "")
+                if raw:
+                    stream_payload["model"] = raw.split("/", 1)[-1]
+            except Exception:
+                ...
         _rec["resolved_model"] = model_to_use
         if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
             try:
@@ -654,7 +736,9 @@ async def messages(
 
         try:
             upstream_cm = _open_stream(model_to_use)
+            print(f"[proxy] Opening upstream stream with model: {model_to_use}", file=sys.stderr)
             async with upstream_cm as upstream:
+                print(f"[proxy] Upstream stream opened, status: {upstream.status_code}", file=sys.stderr)
                 _rec["phase"] = f"stream_status_{upstream.status_code}"
                 # If upstream returns an error status, emit an SSE error event and stop
                 if upstream.status_code >= 400:
@@ -668,12 +752,102 @@ async def messages(
                             message = body_text
                     except Exception:
                         message = f"Upstream returned HTTP {upstream.status_code} without body"
+                    # If it's a 404/400 model not found, try a single retry with case-heuristic and/or suffix-only id
+                    if upstream.status_code in (400, 404):
+                        # Retry path only once
+                        try:
+                            retry_model = None
+                            # 1) Try canonical case via resolver again (could be a stale cache) 
+                            retry_model = await _resolve_case_variant(stream_payload.get("model"), headers0) or None
+                            if not retry_model:
+                                # 2) Try suffix-only id without vendor prefix
+                                raw = str(stream_payload.get("model") or "")
+                                retry_model = raw.split("/", 1)[-1] if raw else None
+                            if retry_model and retry_model != stream_payload.get("model"):
+                                async with _open_stream(retry_model) as upstream2:
+                                    _rec["phase"] = f"stream_retry_status_{upstream2.status_code}"
+                                    if upstream2.status_code < 400:
+                                        # Switch upstream handle transparently
+                                        upstream = upstream2
+                                        model_to_use = retry_model
+                                        stream_payload["model"] = retry_model
+                                        # Fall through into normal SSE handling without re-emitting error
+                                        ct2 = upstream.headers.get("content-type") or upstream.headers.get("Content-Type") or ""
+                                        if "text/event-stream" not in str(ct2).lower():
+                                            # For non-SSE retry, read once and map similar to main path below
+                                            try:
+                                                raw2 = await upstream.aread()
+                                                txt2 = raw2.decode("utf-8", errors="ignore") if raw2 is not None else ""
+                                                data_obj2 = json.loads(txt2) if txt2 else {}
+                                            except Exception:
+                                                data_obj2 = {}
+                                            if not data_obj2:
+                                                yield sse("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream returned no SSE and empty body"}})
+                                                yield sse("message_stop", {"type": "message_stop"})
+                                                _rec["phase"] = "stream_retry_fallback_empty_body"
+                                                _RECENT.append(_rec)
+                                                return
+                                            anth2 = openai_to_anthropic_response(
+                                                data_obj2,
+                                                requested_model=display_model,
+                                                tools=stream_payload.get("tools"),
+                                                tool_call_parser=choose_tool_call_parser(model_to_use),
+                                            )
+                                            ms2 = ensure_message_start()
+                                            if ms2:
+                                                yield ms2
+                                            for blk in (anth2.get("content") or []):
+                                                btype = blk.get("type")
+                                                if btype == "thinking":
+                                                    cb_index = next_block_index
+                                                    next_block_index += 1
+                                                    yield sse("content_block_start", {"type": "content_block_start", "index": cb_index, "content_block": {"type": "thinking", "thinking": ""}})
+                                                    yield sse("content_block_delta", {"type": "content_block_delta", "index": cb_index, "delta": {"type": "thinking_delta", "thinking": blk.get("thinking", "")}})
+                                                    yield sse("content_block_stop", {"type": "content_block_stop", "index": cb_index})
+                                                elif btype == "text":
+                                                    ts2 = ensure_text_block()
+                                                    if ts2:
+                                                        yield ts2
+                                                    yield sse("content_block_delta", {"type": "content_block_delta", "index": text_block_index, "delta": {"type": "text_delta", "text": blk.get("text", "")}})
+                                                elif btype == "tool_use":
+                                                    cb_index = next_block_index
+                                                    next_block_index += 1
+                                                    tid = blk.get("id") or f"call_{uuid.uuid4().hex}"
+                                                    tname = blk.get("name") or ""
+                                                    tinput = blk.get("input") or {}
+                                                    yield sse("content_block_start", {"type": "content_block_start", "index": cb_index, "content_block": {"type": "tool_use", "id": tid, "name": tname, "input": {}}})
+                                                    try:
+                                                        args_str = json.dumps(tinput, ensure_ascii=False)
+                                                    except Exception:
+                                                        args_str = "{}"
+                                                    yield sse("content_block_delta", {"type": "content_block_delta", "index": cb_index, "delta": {"type": "input_json_delta", "partial_json": args_str}})
+                                                    yield sse("content_block_stop", {"type": "content_block_stop", "index": cb_index})
+                                                    emitted_tool_use = True
+                                            if text_block_index is not None:
+                                                yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                                                text_block_index = None
+                                            usage_obj2 = anth2.get("usage") or {}
+                                            stop_reason2 = anth2.get("stop_reason") or ("tool_use" if emitted_tool_use else "end_turn")
+                                            yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason2, "stop_sequence": None}, "usage": {"input_tokens": int(usage_obj2.get("input_tokens") or 0), "output_tokens": int(usage_obj2.get("output_tokens") or 0)}})
+                                            yield sse("message_stop", {"type": "message_stop"})
+                                            _rec["phase"] = "stream_retry_fallback_non_sse"
+                                            _RECENT.append(_rec)
+                                            return
+                                        # if SSE, continue into normal streaming loop
+                                    # If retry still fails, fall through to emit original error below
+                        except Exception:
+                            ...
                     try:
                         err_env = _anthropic_error_for_status(upstream.status_code, message or "")
                         etype = (err_env.get("error") or {}).get("type") or "api_error"
                     except Exception:
                         etype = "api_error"
+                    # Emit a well-formed message envelope even on error to avoid client-side abrupt end
+                    ms0 = ensure_message_start()
+                    if ms0:
+                        yield ms0
                     yield sse("error", {"type": "error", "error": {"type": etype, "message": message or "Upstream error"}})
+                    yield sse("message_stop", {"type": "message_stop"})
                     _rec["phase"] = "stream_error_status"
                     _rec["upstream_status"] = upstream.status_code
                     _rec["message"] = message
@@ -690,7 +864,11 @@ async def messages(
                     except Exception:
                         data_obj = {}
                     if not data_obj:
+                        ms1 = ensure_message_start()
+                        if ms1:
+                            yield ms1
                         yield sse("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream returned no SSE and empty body"}})
+                        yield sse("message_stop", {"type": "message_stop"})
                         _rec["phase"] = "stream_fallback_empty_body"
                         _RECENT.append(_rec)
                         return
@@ -789,6 +967,7 @@ async def messages(
 
                 # Guard: if no chunks are received at all, emit an error event instead of silently ending
                 no_chunks = True
+                print("[proxy] Starting stream processing", file=sys.stderr)
                 # Anthropic stream scaffold
                 final_text: list[str] = []
                 sent_start = False
@@ -891,19 +1070,29 @@ async def messages(
                             return ""
                         # Common synonyms fallback
                         synonyms = {
-                            "grep": "grep",
-                            "glob": "glob_file_search",
-                            "globfiles": "glob_file_search",
-                            "todowrite": "todo_write",
-                            "todo": "todo_write",
-                            "bash": "run_terminal_cmd",
-                            "shell": "run_terminal_cmd",
-                            "run": "run_terminal_cmd",
-                            "runcmd": "run_terminal_cmd",
-                            "runcmds": "run_terminal_cmd",
-                            "runcommand": "run_terminal_cmd",
-                            "terminal": "run_terminal_cmd",
-                            "sh": "run_terminal_cmd",
+                            "grep": "Grep",
+                            "glob": "Glob",
+                            "globfiles": "Glob",
+                            "todowrite": "TodoWrite",
+                            "todo": "TodoWrite",
+                            "bash": "Bash",
+                            "shell": "Bash",
+                            "run": "Bash",
+                            "runcmd": "Bash",
+                            "runcmds": "Bash",
+                            "runcommand": "Bash",
+                            "terminal": "Bash",
+                            "sh": "Bash",
+                            # Additional common aliases observed in MCP tool markup
+                            "terminal_execute": "Bash",
+                            "terminal-execute": "Bash",
+                            "terminalexec": "Bash",
+                            "terminal_run": "Bash",
+                            "execute_terminal": "Bash",
+                            # Additional synonyms for better compatibility
+                            "run_terminal_cmd": "Bash",
+                            "glob_file_search": "Glob",
+                            "todo_write": "TodoWrite",
                         }
                         name_in = synonyms.get(name_in) or synonyms.get(name_in.lower()) or name_in
                         # 1) exact match against declared
@@ -1094,12 +1283,41 @@ async def messages(
                 no_reasoning_streak = 0
 
                 async for line in upstream.aiter_lines():
+                        # Check if client has disconnected
+                        if await request.is_disconnected():
+                            print("[proxy] Client disconnected during streaming", file=sys.stderr)
+                            # Close any open blocks before ending
+                            if text_block_index is not None:
+                                yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                            if thinking_open and thinking_block_index is not None:
+                                yield sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                            for st in list(tool_states.values()):
+                                if st.get("open"):
+                                    yield sse("content_block_stop", {"type": "content_block_stop", "index": st["cb_index"]})
+                            # Emit final message delta and stop
+                            yield sse(
+                                "message_delta",
+                                {
+                                    "type": "message_delta",
+                                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                    "usage": {"input_tokens": usage_input, "output_tokens": usage_output},
+                                },
+                            )
+                            yield sse("message_stop", {"type": "message_stop"})
+                            _rec["phase"] = "stream_client_disconnected"
+                            _RECENT.append(_rec)
+                            print("[proxy] Stream ended due to client disconnection", file=sys.stderr)
+                            return
+
                         if not line:
+                            print("[proxy] Received empty line", file=sys.stderr)
                             continue
                         if not line.startswith("data:"):
+                            print(f"[proxy] Received non-data line: {line[:100]}", file=sys.stderr)
                             continue
                         no_chunks = False
                         payload_str = line[5:].strip()
+                        print(f"[proxy] Received stream line: {payload_str[:100]}...", file=sys.stderr)
                         if payload_str == "[DONE]":
                             # Close any open blocks
                             if text_block_index is not None:
@@ -1294,21 +1512,62 @@ async def messages(
                                 def _parse_simple_calls(section: str):
                                     import re as _re
                                     simple_calls: list[dict] = []
-                                    pattern = _re.compile(r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>", _re.DOTALL)
-                                    for m in pattern.finditer(section):
-                                        name = (m.group(1) or '').strip()
-                                        args_raw = (m.group(2) or '').strip()
+                                    try:
+                                        # Try multiple patterns to handle different character encodings
+                                        patterns = [
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>",
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)(?:<\|tool_call_end\|>|\s*$)",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)<｜tool▁call▁end｜>",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)"
+                                        ]
+
+                                        for pattern_str in patterns:
+                                            try:
+                                                pattern = _re.compile(pattern_str, _re.DOTALL)
+                                                for m in pattern.finditer(section):
+                                                    name = (m.group(1) or '').strip()
+                                                    args_raw = (m.group(2) or '').strip()
+                                                    try:
+                                                        import json as _json
+                                                        args = _json.loads(args_raw)
+                                                    except Exception:
+                                                        args = {}
+                                                    simple_calls.append({
+                                                        "type": "tool_use",
+                                                        "id": f"call_{uuid.uuid4().hex}",
+                                                        "name": name,
+                                                        "input": args if isinstance(args, dict) else {}
+                                                    })
+                                                # If we found matches with this pattern, break
+                                                if simple_calls:
+                                                    break
+                                            except Exception:
+                                                continue
+                                    except Exception as e:
+                                        # Log the error for debugging but don't crash
+                                        print(f"[proxy] Error parsing simple calls: {e}", file=sys.stderr)
+                                        # Try alternative parsing for malformed tool calls
                                         try:
-                                            import json as _json
-                                            args = _json.loads(args_raw)
+                                            # Handle case where tool calls might be malformed
+                                            tools = ["TodoWrite", "Read", "Write", "Edit", "Grep", "Glob", "Bash"]
+                                            for tool_name in tools:
+                                                if tool_name in section:
+                                                    # Try to extract tool calls with a more permissive pattern
+                                                    alt_pattern = _re.compile(rf"{tool_name}[^\{{]*(\{{.*?\}})")
+                                                    for m in alt_pattern.finditer(section):
+                                                        try:
+                                                            import json as _json
+                                                            args = _json.loads(m.group(1))
+                                                            simple_calls.append({
+                                                                "type": "tool_use",
+                                                                "id": f"call_{uuid.uuid4().hex}",
+                                                                "name": tool_name,
+                                                                "input": args if isinstance(args, dict) else {}
+                                                            })
+                                                        except Exception:
+                                                            pass
                                         except Exception:
-                                            args = {}
-                                        simple_calls.append({
-                                            "type": "tool_use",
-                                            "id": f"call_{uuid.uuid4().hex}",
-                                            "name": name,
-                                            "input": args if isinstance(args, dict) else {}
-                                        })
+                                            pass
                                     return simple_calls
 
                                 def _is_marker_only(text: str) -> bool:
@@ -1533,21 +1792,62 @@ async def messages(
                                 def _parse_simple_calls(section: str):
                                     import re as _re
                                     simple_calls: list[dict] = []
-                                    pattern = _re.compile(r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>", _re.DOTALL)
-                                    for m in pattern.finditer(section):
-                                        name = (m.group(1) or '').strip()
-                                        args_raw = (m.group(2) or '').strip()
+                                    try:
+                                        # Try multiple patterns to handle different character encodings
+                                        patterns = [
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>",
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)(?:<\|tool_call_end\|>|\s*$)",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)<｜tool▁call▁end｜>",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)"
+                                        ]
+
+                                        for pattern_str in patterns:
+                                            try:
+                                                pattern = _re.compile(pattern_str, _re.DOTALL)
+                                                for m in pattern.finditer(section):
+                                                    name = (m.group(1) or '').strip()
+                                                    args_raw = (m.group(2) or '').strip()
+                                                    try:
+                                                        import json as _json
+                                                        args = _json.loads(args_raw)
+                                                    except Exception:
+                                                        args = {}
+                                                    simple_calls.append({
+                                                        "type": "tool_use",
+                                                        "id": f"call_{uuid.uuid4().hex}",
+                                                        "name": name,
+                                                        "input": args if isinstance(args, dict) else {}
+                                                    })
+                                                # If we found matches with this pattern, break
+                                                if simple_calls:
+                                                    break
+                                            except Exception:
+                                                continue
+                                    except Exception as e:
+                                        # Log the error for debugging but don't crash
+                                        print(f"[proxy] Error parsing simple calls: {e}", file=sys.stderr)
+                                        # Try alternative parsing for malformed tool calls
                                         try:
-                                            import json as _json
-                                            args = _json.loads(args_raw)
+                                            # Handle case where tool calls might be malformed
+                                            tools = ["TodoWrite", "Read", "Write", "Edit", "Grep", "Glob", "Bash"]
+                                            for tool_name in tools:
+                                                if tool_name in section:
+                                                    # Try to extract tool calls with a more permissive pattern
+                                                    alt_pattern = _re.compile(rf"{tool_name}[^\{{]*(\{{.*?\}})")
+                                                    for m in alt_pattern.finditer(section):
+                                                        try:
+                                                            import json as _json
+                                                            args = _json.loads(m.group(1))
+                                                            simple_calls.append({
+                                                                "type": "tool_use",
+                                                                "id": f"call_{uuid.uuid4().hex}",
+                                                                "name": tool_name,
+                                                                "input": args if isinstance(args, dict) else {}
+                                                            })
+                                                        except Exception:
+                                                            pass
                                         except Exception:
-                                            args = {}
-                                        simple_calls.append({
-                                            "type": "tool_use",
-                                            "id": f"call_{uuid.uuid4().hex}",
-                                            "name": name,
-                                            "input": args if isinstance(args, dict) else {}
-                                        })
+                                            pass
                                     return simple_calls
 
                                 def _drain_mcp(buf: str):
@@ -1875,20 +2175,99 @@ async def messages(
                             _rec["phase"] = "stream_ok_finish"
                             _RECENT.append(_rec)
                             break
-                # After stream finishes, if no lines were received, surface an error to client
+                # After stream finishes, finalize depending on whether any chunks arrived
                 if no_chunks:
-                    yield sse("error", {"type": "error", "error": {"type": "api_error", "message": "Upstream stream ended without sending any chunks"}})
-                    _rec["phase"] = "stream_empty_no_chunks"
+                    # Instead of throwing an error, gracefully handle empty streams by sending an empty response
+                    # This can happen with certain models or under specific conditions
+                    if not sent_start:
+                        ms = ensure_message_start()
+                        if ms:
+                            yield ms
+
+                    # Emit final message delta and stop with end_turn reason for empty responses
+                    yield sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                            "usage": {"input_tokens": usage_input, "output_tokens": usage_output},
+                        },
+                    )
+                    yield sse("message_stop", {"type": "message_stop"})
+                    _rec["phase"] = "stream_empty_no_chunks_handled"
                     _RECENT.append(_rec)
+                else:
+                    # Upstream ended without explicit terminator ([DONE] / finish_reason). Gracefully close blocks and stop.
+                    # Flush any deferred text moved out from thinking before closing blocks
+                    if pending_text_after_thinking:
+                        if not sent_start:
+                            ms = ensure_message_start()
+                            if ms:
+                                yield ms
+                        if text_block_index is None:
+                            text_block_index = next_block_index
+                            next_block_index += 1
+                            yield sse(
+                                "content_block_start",
+                                {"type": "content_block_start", "index": text_block_index, "content_block": {"type": "text", "text": ""}},
+                            )
+                        yield sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {"type": "text_delta", "text": pending_text_after_thinking},
+                            },
+                        )
+                        pending_text_after_thinking = ""
+
+                    # Close any open content blocks
+                    if text_block_index is not None:
+                        yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                        text_block_index = None
+                    if thinking_open and thinking_block_index is not None:
+                        yield sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                        thinking_open = False
+                        thinking_block_index = None
+                    for st in list(tool_states.values()):
+                        if st.get("open"):
+                            yield sse("content_block_stop", {"type": "content_block_stop", "index": st["cb_index"]})
+                            st["open"] = False
+
+                    # Emit final message delta and stop with a conservative stop_reason
+                    final_stop = "tool_use" if emitted_tool_use else "end_turn"
+                    yield sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": final_stop, "stop_sequence": None},
+                            "usage": {"input_tokens": usage_input, "output_tokens": usage_output},
+                        },
+                    )
+                    yield sse("message_stop", {"type": "message_stop"})
+                    _rec["phase"] = "stream_ok_eof"
+                    _RECENT.append(_rec)
+                    print("[proxy] Stream ended normally", file=sys.stderr)
         except Exception as e:
-            # Surface upstream error as Anthropic error (single event)
+            # Surface upstream error as Anthropic error (single event) with graceful stop
+            msx = ensure_message_start()
+            if msx:
+                yield msx
+            # Log the exception for debugging purposes
+            print(f"[proxy] stream exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
             data = {"type": "error", "error": {"type": "upstream_error", "message": str(e)}}
             yield f"event: error\n".encode() + f"data: {json.dumps(data)}\n\n".encode()
+            yield sse("message_stop", {"type": "message_stop"})
             _rec["phase"] = "stream_exception"
             _rec["message"] = str(e)
+            _rec["exception_type"] = type(e).__name__
             _RECENT.append(_rec)
+            print(f"[proxy] Stream ended with exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(request), media_type="text/event-stream")
 
 
 @app.get("/")
