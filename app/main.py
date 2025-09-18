@@ -740,6 +740,53 @@ async def messages(
             async with upstream_cm as upstream:
                 print(f"[proxy] Upstream stream opened, status: {upstream.status_code}", file=sys.stderr)
                 _rec["phase"] = f"stream_status_{upstream.status_code}"
+                # Initialize message envelope state before handling error paths
+                sent_start = False
+                model_name = None
+                usage_input = 0
+                usage_output = 0
+                emitted_tool_use = False
+
+                # Content block management must exist early for retry/error fallbacks
+                next_block_index = 0
+                text_block_index: int | None = None
+                tool_states: Dict[int, Dict[str, Any]] = {}
+
+                def ensure_message_start():
+                    nonlocal sent_start
+                    if not sent_start:
+                        msg = {
+                            "id": f"msg_{uuid.uuid4().hex}",
+                            "type": "message",
+                            "role": "assistant",
+                            # Outward-facing: always echo the originally requested casing
+                            "model": display_model or model_name or stream_payload.get("model", "unknown-model"),
+                            # Start with empty content to align with Anthropic stream semantics
+                            "content": [],
+                            # Provide a usage object upfront to satisfy clients that read it early
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                        }
+                        sent_start = True
+                        return sse("message_start", {"type": "message_start", "message": msg})
+                    return None
+
+                def ensure_text_block():
+                    nonlocal text_block_index, next_block_index
+                    if text_block_index is None:
+                        text_block_index = next_block_index
+                        next_block_index += 1
+                        return sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": text_block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            },
+                        )
+                    return None
+
                 # If upstream returns an error status, emit an SSE error event and stop
                 if upstream.status_code >= 400:
                     try:
@@ -970,51 +1017,6 @@ async def messages(
                 print("[proxy] Starting stream processing", file=sys.stderr)
                 # Anthropic stream scaffold
                 final_text: list[str] = []
-                sent_start = False
-                model_name = None
-                usage_input = 0
-                usage_output = 0
-                emitted_tool_use = False
-
-                # Content block management
-                next_block_index = 0
-                text_block_index: int | None = None
-                tool_states: Dict[int, Dict[str, Any]] = {}
-
-                def ensure_message_start():
-                    nonlocal sent_start
-                    if not sent_start:
-                        msg = {
-                            "id": f"msg_{uuid.uuid4().hex}",
-                            "type": "message",
-                            "role": "assistant",
-                            # Outward-facing: always echo the originally requested casing
-                            "model": display_model or model_name or stream_payload.get("model", "unknown-model"),
-                            # Start with empty content to align with Anthropic stream semantics
-                            "content": [],
-                            # Provide a usage object upfront to satisfy clients that read it early
-                            "usage": {"input_tokens": 0, "output_tokens": 0},
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                        }
-                        sent_start = True
-                        return sse("message_start", {"type": "message_start", "message": msg})
-                    return None
-
-                def ensure_text_block():
-                    nonlocal text_block_index, next_block_index
-                    if text_block_index is None:
-                        text_block_index = next_block_index
-                        next_block_index += 1
-                        return sse(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": text_block_index,
-                                "content_block": {"type": "text", "text": ""},
-                            },
-                        )
-                    return None
 
                 # Prepare sglang FunctionCallParser if tools exist and enabled
                 parser = None
@@ -2250,9 +2252,11 @@ async def messages(
                     print("[proxy] Stream ended normally", file=sys.stderr)
         except Exception as e:
             # Surface upstream error as Anthropic error (single event) with graceful stop
-            msx = ensure_message_start()
-            if msx:
-                yield msx
+            ms_fn = locals().get("ensure_message_start")
+            if callable(ms_fn):
+                msx = ms_fn()
+                if msx:
+                    yield msx
             # Log the exception for debugging purposes
             print(f"[proxy] stream exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
             import traceback

@@ -430,6 +430,36 @@ def openai_to_anthropic_response(
     # Extract content
     text = ""
     tool_calls_block: List[Dict[str, Any]] = []
+    thinking_blocks: List[Dict[str, Any]] = []
+    model_name = str(requested_model or oai.get("model") or "")
+    is_deepseek_model = "deepseek" in model_name.lower()
+
+    # Preserve declared tool names (if any) so we can map upstream aliases back to canonical casing
+    declared_tool_names: list[str] = []
+    declared_tool_lookup: Dict[str, str] = {}
+    try:
+        for t in tools or []:
+            if not isinstance(t, dict):
+                continue
+            name: Optional[str] = None
+            fn = t.get("function")
+            if isinstance(fn, dict):
+                maybe = fn.get("name")
+                if isinstance(maybe, str) and maybe.strip():
+                    name = maybe.strip()
+            if not name:
+                maybe = t.get("name")
+                if isinstance(maybe, str) and maybe.strip():
+                    name = maybe.strip()
+            if name:
+                declared_tool_names.append(name)
+    except Exception:
+        declared_tool_names = []
+    if declared_tool_names:
+        try:
+            declared_tool_lookup = {n.lower(): n for n in declared_tool_names}
+        except Exception:
+            declared_tool_lookup = {}
     def _maybe_parse_tools_with_sglang(text_block: str) -> tuple[str, list[Dict[str, Any]]]:
         global FunctionCallParser
         if FunctionCallParser is None:
@@ -501,6 +531,13 @@ def openai_to_anthropic_response(
         def _map_name(n: Optional[str]) -> str:
             try:
                 raw = (n or "").strip()
+                if not raw:
+                    return ""
+                if raw in declared_tool_names:
+                    return raw
+                low = raw.lower()
+                if declared_tool_lookup and low in declared_tool_lookup:
+                    return declared_tool_lookup[low]
                 mapped = settings.map_tool_name(requested_model or oai.get("model"), raw)
                 out = (mapped or raw) if isinstance(mapped, str) else raw
                 # Common synonyms (case-insensitive)
@@ -524,7 +561,13 @@ def openai_to_anthropic_response(
                     "todo_write": "TodoWrite",
                 }
                 out = synonyms.get(out) or synonyms.get(out.lower()) or out
-                if out == raw and out and (any(ch.isupper() for ch in out) and "_" not in out):
+                if out in declared_tool_names:
+                    return out
+                if declared_tool_lookup:
+                    low_out = out.lower()
+                    if low_out in declared_tool_lookup:
+                        return declared_tool_lookup[low_out]
+                if not declared_tool_names and out and (any(ch.isupper() for ch in out) and "_" not in out):
                     import re as _re
                     s1 = _re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", out)
                     s2 = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
@@ -538,14 +581,14 @@ def openai_to_anthropic_response(
         text = message.get("content") or ""
         # If available, include reasoning content as a dedicated thinking block (for proper UI display)
         reasoning = message.get("reasoning_content")
-        reasoning_block = []
         if reasoning:
-            reasoning_block = [
-                {
-                    "type": "thinking",
-                    "thinking": str(reasoning),
-                }
-            ]
+            # DeepSeek sometimes returns arrays; collapse to plain string
+            if isinstance(reasoning, (list, tuple)):
+                joined = "".join(str(part) for part in reasoning if part is not None)
+            else:
+                joined = str(reasoning)
+            if joined.strip():
+                thinking_blocks.append({"type": "thinking", "thinking": joined})
         # Convert OpenAI tool_calls to Anthropic tool_use blocks
         tcalls = message.get("tool_calls") or []
         for tc in tcalls:
@@ -579,6 +622,21 @@ def openai_to_anthropic_response(
                 except Exception:
                     ...
             tool_calls_block.extend(deepseek_calls)
+            # DeepSeek tool calls often prepend textual "Thinking…" placeholders. Promote them to thinking blocks.
+            stripped = text.strip()
+            if stripped and is_deepseek_model and tool_calls_block:
+                normalized_prefix = stripped[:64].lower().replace("…", "...")
+                normalized_prefix = normalized_prefix.replace("：", ":")
+                normalized_full = stripped.lower().replace("…", "...").strip()
+                placeholder_values = {"thinking...", "thinking.", "thinking", "thought...", "analysis...", "analysis."}
+                if normalized_prefix.startswith("thinking") or normalized_prefix.startswith("thought") or normalized_prefix.startswith("analysis"):
+                    if normalized_full not in placeholder_values:
+                        thinking_blocks.append({"type": "thinking", "thinking": stripped})
+                    stripped = ""
+                if not stripped:
+                    text = ""
+                else:
+                    text = stripped
         # Fallback: use sglang parser on textual content when no structured tool_calls
         if not tcalls and text:
             text, parsed_calls = _maybe_parse_tools_with_sglang(text)
@@ -603,11 +661,11 @@ def openai_to_anthropic_response(
 
     content_blocks: List[Dict[str, Any]] = []
     if text:
-        if str(text).strip():
-            content_blocks.append({"type": "text", "text": text})
-    # Prepend reasoning if present (as a thinking block)
-    if 'reasoning_block' in locals() and reasoning_block:
-        content_blocks = reasoning_block + content_blocks
+        trimmed_text = str(text).strip()
+        if trimmed_text:
+            content_blocks.append({"type": "text", "text": trimmed_text})
+    if thinking_blocks:
+        content_blocks = thinking_blocks + content_blocks
     content_blocks.extend(tool_calls_block)
 
     return {
@@ -800,4 +858,24 @@ def json_loads_safe(s: Any) -> Any:
             return json.loads(s)
         return s
     except Exception:
+        if isinstance(s, str):
+            try:
+                repaired = _repair_invalid_json_escapes(s)
+                if repaired != s:
+                    import json
+
+                    return json.loads(repaired)
+            except Exception:
+                ...
         return {}
+
+
+_INVALID_ESCAPE_RE = re.compile(r"\\(?![\\\"/bfnrtu])")
+
+
+def _repair_invalid_json_escapes(raw: str) -> str:
+    """Best-effort fix for JSON strings containing invalid escape sequences."""
+    try:
+        return _INVALID_ESCAPE_RE.sub("", raw)
+    except Exception:
+        return raw

@@ -271,3 +271,149 @@ def test_deepseek_v31_tool_call_parsing():
     
     assert remaining_text3 == text3
     assert len(tool_calls3) == 0
+
+
+def test_deepseek_tool_call_preserves_declared_name():
+    """DeepSeek tool markup should retain declared tool casing when available."""
+    from app.transform import openai_to_anthropic_response
+
+    message_text = (
+        "Thinking…\n\n"
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>TodoWrite<｜tool▁sep｜>"
+        "{\"todos\": [{\"content\": \"检查Nacos容器启动状态\", \"status\": \"completed\","
+        " \"activeForm\": \"检查Nacos容器启动状态\"}], \"command\": \"curl -s http://127.0.0.1:8848/nacos/v1/cs/configs?dataId=user-sample-service.yaml\\&group=DEFAULT_GROUP\"}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    oai_resp = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "deepseek-ai/DeepSeek-V3.1",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": message_text,
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "description": "",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    anthropic = openai_to_anthropic_response(oai_resp, requested_model="deepseek-ai/DeepSeek-V3.1", tools=tools)
+    tool_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "tool_use"]
+
+    assert tool_blocks, "expected tool_use block from DeepSeek markup"
+    first_call = tool_blocks[0]
+    assert first_call["name"] == "TodoWrite"
+    payload = first_call.get("input") or {}
+    assert payload.get("command") == (
+        "curl -s http://127.0.0.1:8848/nacos/v1/cs/configs?dataId=user-sample-service.yaml&group=DEFAULT_GROUP"
+    )
+
+
+def test_deepseek_thinking_placeholder_removed():
+    from app.transform import openai_to_anthropic_response
+
+    message_text = (
+        "Thinking…\n\n"
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>TodoWrite<｜tool▁sep｜>{\"todos\": []}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    oai_resp = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "deepseek-ai/DeepSeek-V3.1",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": message_text,
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "description": "",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    anthropic = openai_to_anthropic_response(oai_resp, requested_model="deepseek-ai/DeepSeek-V3.1", tools=tools)
+    tool_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "tool_use"]
+    text_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "text"]
+    thinking_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "thinking"]
+
+    assert tool_blocks, "expected tool_use block from DeepSeek markup"
+    assert not text_blocks, "Thinking placeholder should not surface as text"
+    assert not thinking_blocks, "pure placeholder text should be dropped"
+
+
+def test_deepseek_reasoning_promoted_to_thinking():
+    from app.transform import openai_to_anthropic_response
+
+    message_text = (
+        "Thinking…\n1. Inspect request.\n2. Prepare tool payload.\n\n"
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>TodoWrite<｜tool▁sep｜>{\"todos\": []}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    oai_resp = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "deepseek-ai/DeepSeek-V3.1",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": message_text,
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "description": "",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    anthropic = openai_to_anthropic_response(oai_resp, requested_model="deepseek-ai/DeepSeek-V3.1", tools=tools)
+    thinking_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "thinking"]
+    text_blocks = [blk for blk in anthropic.get("content", []) if blk.get("type") == "text"]
+
+    assert thinking_blocks, "reasoning text should convert to thinking block"
+    assert thinking_blocks[0]["thinking"].startswith("Thinking…")
+    assert not text_blocks, "reasoning text should not appear as plain text"
