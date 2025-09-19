@@ -148,6 +148,50 @@ def test_choose_parser_heuristics():
     assert choose_tool_call_parser("longcat/Longcat-Flash-8B") == "gpt-oss"
 
 
+def test_longcat_prompt_formatting_basic():
+    req = {
+        "model": "longcat/Longcat-Flash-8B",
+        "system": [{"type": "text", "text": "Be concise."}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+        ],
+    }
+    out = anthropic_to_openai_payload(req)
+    assert out["messages"][0]["role"] == "user"
+    prompt = out["messages"][0]["content"]
+    assert prompt.startswith("markdown")
+    assert "## Messages" in prompt
+    assert "SYSTEM:Be concise." in prompt
+    assert "[Round 0] USER:Hello ASSISTANT:" in prompt
+
+
+def test_longcat_prompt_with_history_and_tools():
+    req = {
+        "model": "longcat/Longcat-Flash-8B",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello there"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Need weather"}]},
+        ],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Weather lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    out = anthropic_to_openai_payload(req)
+    prompt = out["messages"][0]["content"]
+    assert "## Tools" in prompt
+    assert "#### Tool name: get_weather" in prompt
+    assert "[Round 0] USER:Hi ASSISTANT:Hello there</longcat_s>" in prompt
+    assert prompt.strip().endswith("[Round 1] USER:Need weather ASSISTANT:")
+
+
 def test_stream_chunk_tool_parse_pythonic():
     # Simulate a streaming text delta that includes a pythonic tool call
     tools = [
@@ -183,6 +227,67 @@ def test_stream_chunk_tool_parse_unknown_markup():
     text = "A <tool_call_textual>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call_textual> B"
     normal, calls = parse_stream_tools_text(text, tools, model_name="unknown-model")
     assert (any(call.get("name") == "get_weather" for call in calls)) or ("<tool_call_textual>" in normal)
+
+
+def test_stream_chunk_longcat_markup():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+    chunk = (
+        "Working on it</longcat_s><longcat_tool_call>\n"
+        "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"SF\"}}\n"
+        "</longcat_tool_call>"
+    )
+    normal, calls = parse_stream_tools_text(chunk, tools, model_name="longcat/Longcat-Flash-8B")
+    assert "Working on it" in normal
+    assert "</longcat_s>" not in normal
+    assert len(calls) == 1 and calls[0]["name"] == "get_weather"
+
+
+def test_openai_longcat_tool_markup_parsing():
+    oai_resp = {
+        "id": "chatcmpl-longcat",
+        "object": "chat.completion",
+        "created": 2,
+        "model": "longcat/Longcat-Flash-8B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "Calling tool\n<longcat_tool_call>\n"
+                        "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"SF\"}}\n"
+                        "</longcat_tool_call>"
+                    ),
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+    anth = openai_to_anthropic_response(oai_resp, requested_model="longcat/Longcat-Flash-8B", tools=tools)
+    texts = [block for block in anth["content"] if block.get("type") == "text"]
+    assert texts and "Calling tool" in texts[0]["text"]
+    assert "</longcat_s>" not in texts[0]["text"]
+    tool_blocks = [block for block in anth["content"] if block.get("type") == "tool_use"]
+    assert tool_blocks and tool_blocks[0]["name"] == "get_weather"
+    assert tool_blocks[0]["input"] == {"city": "SF"}
 
 
 def test_deepseek_v31_prompt_formatting():

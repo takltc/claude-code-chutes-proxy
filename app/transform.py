@@ -45,17 +45,19 @@ def _to_text(content) -> str:
 
 def anthropic_to_openai_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """Map Anthropic v1/messages body to OpenAI Chat Completions for Chutes backend."""
-    model = settings.map_model(body.get("model"))
+    requested_model = body.get("model")
+    model = settings.map_model(requested_model)
     messages = body.get("messages", [])
     system = body.get("system")
+    system_text = _to_text(system)
+    longcat_mode = is_longcat_model(requested_model) or is_longcat_model(model)
 
     oai_messages: List[Dict[str, Any]] = []
-    # Map `system` to a system message if present
-    if system:
-        oai_messages.append({"role": "system", "content": _to_text(system)})
+    # Map `system` to a system message if present (non-LongCat requests; LongCat overrides later)
+    if system_text:
+        oai_messages.append({"role": "system", "content": system_text})
 
     # We must normalize tool_result/tool_use blocks into OpenAI-style messages
-    pending_user_text: Optional[str] = None
     for m in messages:
         role = m.get("role")
         content = m.get("content")
@@ -174,6 +176,10 @@ def anthropic_to_openai_payload(body: Dict[str, Any]) -> Dict[str, Any]:
         payload["tools"] = oai_tools
         # Encourage upstream function-calling
         payload["tool_choice"] = "auto"
+
+    if longcat_mode:
+        prompt_text = format_longcat_prompt(system, messages, tools)
+        payload["messages"] = [{"role": "user", "content": prompt_text}]
     # Validate and normalize via sglang's OpenAI schema if available
     if ChatCompletionRequest is not None:
         try:
@@ -277,6 +283,15 @@ def parse_mcp_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]]:
     return "".join(out_text_parts), calls
 
 
+def is_longcat_model(model_name: Optional[str]) -> bool:
+    if not model_name:
+        return False
+    try:
+        return "longcat" in str(model_name).lower()
+    except Exception:
+        return False
+
+
 def choose_tool_call_parser(model_name: Optional[str]) -> str:
     s = (model_name or "").lower()
     if not s:
@@ -284,7 +299,7 @@ def choose_tool_call_parser(model_name: Optional[str]) -> str:
     # Longcat models frequently adopt T4/GPT‑OSS style tool-call channels
     # e.g., <|channel|>commentary to=functions.xxx<|constrain|>json<|message|>{...}<|call|>
     # Map them to the sglang "gpt-oss" detector.
-    if "longcat" in s:
+    if is_longcat_model(s):
         return "gpt-oss"
     if "llama-3" in s or "llama3" in s:
         return "llama3"
@@ -308,6 +323,159 @@ def choose_tool_call_parser(model_name: Optional[str]) -> str:
     if "step-3" in s or "step3" in s or s.startswith("o3") or "-o3" in s:
         return "step3"
     return "pythonic"
+
+
+def _block_get(block: Any, key: str, default: Any = None) -> Any:
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _longcat_dump_json(data: Any, indent: int = 2) -> str:
+    try:
+        import json
+
+        return json.dumps(data, ensure_ascii=False, indent=indent)
+    except Exception:
+        return json_dumps_safe(data)
+
+
+def _flatten_longcat_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    stripped = str(text).strip()
+    if not stripped:
+        return ""
+    if "<longcat_tool_call>" in stripped or stripped.startswith("{") or stripped.startswith("["):
+        return stripped
+    return " ".join(stripped.split())
+
+
+def _longcat_message_text(message: Dict[str, Any]) -> str:
+    if not message:
+        return ""
+    content = message.get("content")
+    role = message.get("role")
+    if isinstance(content, str):
+        return content.strip()
+    parts: List[str] = []
+    for block in content or []:
+        btype = _block_get(block, "type")
+        if btype == "text":
+            parts.append(str(_block_get(block, "text", "")))
+        elif btype == "tool_use" and role == "assistant":
+            payload = {
+                "name": _block_get(block, "name", ""),
+                "arguments": _block_get(block, "input", {}) or {},
+            }
+            parts.append(
+                "<longcat_tool_call>\n"
+                f"{_longcat_dump_json(payload)}\n"
+                "</longcat_tool_call>"
+            )
+        elif btype == "tool_result":
+            name = _block_get(block, "name", "") or ""
+            result = _to_text(_block_get(block, "content"))
+            if result:
+                label = f"[tool_result name={name}]" if name else "[tool_result]"
+                parts.append(f"{label} {result}")
+        elif btype == "image":
+            source = _block_get(block, "source") or {}
+            media_type = _block_get(source, "media_type", "image") if isinstance(source, dict) else getattr(source, "media_type", "image")
+            parts.append(f"[image {media_type}]")
+    return "\n".join(p.strip() for p in parts if p is not None)
+
+
+def _merge_longcat_strings(first: Optional[str], second: Optional[str]) -> str:
+    first = first or ""
+    second = second or ""
+    if not first:
+        return second
+    if not second:
+        return first
+    return f"{first}\n{second}"
+
+
+def _longcat_tool_description(tools: Optional[List[Dict[str, Any]]]) -> str:
+    parts: List[str] = ["markdown"]
+    if not tools:
+        return "\n".join(parts)
+    parts.extend(["", "## Tools", "You have access to the following tools:", ""])
+    for tool in tools:
+        function = (tool or {}).get("function") or {}
+        name = (function.get("name") or tool.get("name") or "").strip()
+        description = (function.get("description") or tool.get("description") or "").strip()
+        parameters = function.get("parameters") or tool.get("parameters") or {}
+        schema = _longcat_dump_json(parameters, indent=2)
+        parts.append("### Tool namespace: function")
+        parts.append("")
+        parts.append(f"#### Tool name: {name}")
+        parts.append("")
+        parts.append(f"Description: {description}")
+        parts.append("")
+        parts.append("InputSchema:")
+        parts.append(schema)
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+def format_longcat_prompt(
+    system_prompt: Optional[str],
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    system_parts: List[str] = []
+    if system_prompt:
+        system_text = _flatten_longcat_text(_to_text(system_prompt))
+        if system_text:
+            system_parts.append(system_text)
+
+    rounds: List[Dict[str, Optional[str]]] = []
+    for message in messages or []:
+        role = message.get("role")
+        text = _longcat_message_text(message)
+        if role == "system":
+            if text:
+                system_parts.append(_flatten_longcat_text(text))
+            continue
+        if role == "assistant":
+            if not rounds:
+                rounds.append({"user": "", "assistant": text})
+            elif rounds[-1].get("assistant") is None:
+                rounds[-1]["assistant"] = text
+            else:
+                rounds.append({"user": "", "assistant": text})
+            continue
+        if not rounds:
+            rounds.append({"user": text, "assistant": None})
+            continue
+        if rounds[-1].get("assistant") is None:
+            rounds[-1]["user"] = _merge_longcat_strings(rounds[-1].get("user"), text)
+        else:
+            rounds.append({"user": text, "assistant": None})
+
+    if not rounds:
+        rounds.append({"user": "", "assistant": None})
+
+    system_line = " ".join(part for part in system_parts if part).strip()
+    lines: List[str] = []
+    if system_line:
+        lines.append(f"SYSTEM:{system_line}")
+
+    total_rounds = len(rounds)
+    for idx, round_entry in enumerate(rounds):
+        user_text = _flatten_longcat_text(round_entry.get("user") or "")
+        assistant_raw = round_entry.get("assistant")
+        if assistant_raw is None and idx == total_rounds - 1:
+            lines.append(f"[Round {idx}] USER:{user_text} ASSISTANT:")
+        else:
+            assistant_text = _flatten_longcat_text(assistant_raw or "")
+            lines.append(f"[Round {idx}] USER:{user_text} ASSISTANT:{assistant_text}</longcat_s>")
+
+    messages_section = "\n".join(lines).strip()
+    tool_section = _longcat_tool_description(tools)
+    sections = [section for section in [tool_section, "## Messages", messages_section] if section]
+    return "\n\n".join(sections).strip()
 
 
 def format_deepseek_v31_prompt(system_prompt: str, user_query: str, context: str = "", is_thinking: bool = False) -> str:
@@ -418,6 +586,57 @@ def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]
         pos = j + len(END)
     
     return "".join(out_text_parts), calls
+
+
+_LONGCAT_TOOL_CALL_RE = re.compile(r"<longcat_tool_call>(.*?)</longcat_tool_call>", re.DOTALL)
+
+
+def parse_longcat_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]]:
+    if not text or "<longcat_tool_call" not in text:
+        return text, []
+
+    calls: list[Dict[str, Any]] = []
+    out_parts: list[str] = []
+    last_idx = 0
+    for match in _LONGCAT_TOOL_CALL_RE.finditer(text):
+        start, end = match.span()
+        out_parts.append(text[last_idx:start])
+        payload_raw = (match.group(1) or "").strip()
+        try:
+            payload = json_loads_safe(payload_raw)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            name = payload.get("name") or ""
+            arguments = payload.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            calls.append(
+                {
+                    "type": "tool_use",
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "name": name,
+                    "input": arguments,
+                }
+            )
+        last_idx = end
+    if not calls:
+        return text, []
+    out_parts.append(text[last_idx:])
+    return "".join(out_parts), calls
+
+
+def normalize_longcat_completion(text: Optional[str], model_name: Optional[str] = None) -> str:
+    if not text:
+        return ""
+    out = str(text)
+    if "</longcat_s>" in out:
+        out = out.replace("</longcat_s>", " ")
+    if "[Round" in out and "ASSISTANT:" in out:
+        idx = out.rfind("ASSISTANT:")
+        if idx != -1:
+            out = out[idx + len("ASSISTANT:") :]
+    return out.strip()
 
 
 def openai_to_anthropic_response(
@@ -579,6 +798,11 @@ def openai_to_anthropic_response(
         first_choice = (oai.get("choices") or [{}])[0]
         message = first_choice.get("message") or {}
         text = message.get("content") or ""
+        if isinstance(text, list):
+            try:
+                text = "".join(str(part.get("text", "")) for part in text if isinstance(part, dict))
+            except Exception:
+                text = ""
         # If available, include reasoning content as a dedicated thinking block (for proper UI display)
         reasoning = message.get("reasoning_content")
         if reasoning:
@@ -606,6 +830,13 @@ def openai_to_anthropic_response(
             )
         # Parse Cloud Code MCP tool-call markup first
         if text:
+            text, longcat_calls = parse_longcat_tool_markup(text)
+            for c in longcat_calls or []:
+                try:
+                    c["name"] = _map_name(c.get("name"))
+                except Exception:
+                    ...
+            tool_calls_block.extend(longcat_calls)
             text, markup_calls = parse_mcp_tool_markup(text)
             # apply tool name mapping
             for c in markup_calls or []:
@@ -648,6 +879,8 @@ def openai_to_anthropic_response(
             tool_calls_block.extend(parsed_calls)
     except Exception:
         text = ""
+
+    text = normalize_longcat_completion(text, requested_model or oai.get("model"))
 
     finish_reason = None
     try:
@@ -692,8 +925,17 @@ def parse_stream_tools_text(
 
     Returns (normal_text, tool_use_blocks)
     """
-    if not text_chunk or not tools:
-        return text_chunk or "", []
+    if not text_chunk:
+        return "", []
+
+    cleaned_chunk, markup_calls = parse_longcat_tool_markup(text_chunk)
+    cleaned_chunk = normalize_longcat_completion(cleaned_chunk, model_name)
+    if not tools:
+        return cleaned_chunk, markup_calls
+    if markup_calls:
+        return cleaned_chunk, markup_calls
+    text_chunk = cleaned_chunk
+
     # No model-specific textual branch; rely on sglang parser below
 
     global FunctionCallParser
@@ -746,6 +988,7 @@ def parse_stream_tools_text(
                     "input": args,
                 }
             )
+        normal_text = normalize_longcat_completion(normal_text, model_name)
         return normal_text, calls
     except Exception:
         return text_chunk, []
