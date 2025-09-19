@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import uuid
 
@@ -161,41 +162,68 @@ def _models_cache_key(headers: Dict[str, str]) -> str:
 
 async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
     key = _models_cache_key(headers)
-    now = asyncio.get_event_loop().time()
+    now = time.monotonic()
     ttl = max(5, int(getattr(settings, "model_discovery_ttl", 300)))
     # In-memory cache first
     if key in _MODEL_LIST_CACHE:
         ts, ids = _MODEL_LIST_CACHE[key]
         if now - ts < ttl:
             return ids
+    disk_ids: Optional[List[str]] = None
+    disk_lower_map: Optional[Dict[str, str]] = None
+
+    def _use_disk_cache() -> Optional[List[str]]:
+        if disk_ids is None:
+            return None
+        mp = disk_lower_map if disk_lower_map is not None else {
+            str(mid).strip().lower(): str(mid)
+            for mid in disk_ids
+            if isinstance(mid, str) and str(mid).strip()
+        }
+        _MODEL_LIST_CACHE[key] = (now, list(disk_ids))
+        if mp:
+            _MODEL_CASE_MAP_CACHE[key] = (now, dict(mp))
+        return list(disk_ids)
+
     # Persistent cache (disk) second
-    if settings.model_discovery_persist:
+    if settings.model_discovery_persist and os.path.exists(settings.model_cache_file):
         try:
-            # Load JSON file and pick current key
-            if os.path.exists(settings.model_cache_file):
-                with open(settings.model_cache_file, "r", encoding="utf-8") as f:
-                    obj = json.load(f)
-                ent = (obj or {}).get(key)
-                if ent and isinstance(ent.get("ids"), list):
-                    ids = [str(x) for x in ent.get("ids")]
-                    # Populate case map cache if present
-                    lmap = ent.get("lower_map") if isinstance(ent, dict) else None
-                    if isinstance(lmap, dict):
-                        _MODEL_CASE_MAP_CACHE[key] = (now, {str(k): str(v) for k, v in lmap.items()})
-                    # Populate in-memory cache to avoid future file I/O
-                    _MODEL_LIST_CACHE[key] = (now, ids)
-                    return ids
+            with open(settings.model_cache_file, "r", encoding="utf-8") as f:
+                obj = json.load(f) or {}
+            ent = obj.get(key)
+            if isinstance(ent, dict) and isinstance(ent.get("ids"), list):
+                disk_ids = [str(x) for x in ent.get("ids")]
+                lmap = ent.get("lower_map") if isinstance(ent, dict) else None
+                if isinstance(lmap, dict):
+                    disk_lower_map = {str(k): str(v) for k, v in lmap.items()}
+                ts_raw = ent.get("ts_wall")
+                if ts_raw is None:
+                    ts_raw = ent.get("ts")
+                ts_wall = 0.0
+                try:
+                    if isinstance(ts_raw, (int, float)):
+                        ts_wall = float(ts_raw)
+                    elif isinstance(ts_raw, str) and ts_raw:
+                        ts_wall = float(ts_raw)
+                except Exception:
+                    ts_wall = 0.0
+                wall_now = time.time()
+                if ts_wall > 1e9 and wall_now - ts_wall < ttl:
+                    return _use_disk_cache()
         except Exception:
             ...
     url = f"{settings.chutes_base_url.rstrip('/')}/v1/models"
     client = _get_httpx_client()
     try:
         resp = await client.get(url, headers=headers, timeout=httpx.Timeout(30.0))
-        if resp.status_code >= 400:
-            return None
+    except Exception:
+        return _use_disk_cache()
+    if resp.status_code >= 400:
+        return _use_disk_cache()
+    try:
         data = resp.json()
     except Exception:
-        return None
+        return _use_disk_cache()
     items: List[Any] = []
     if isinstance(data, dict):
         if isinstance(data.get("data"), list):
@@ -207,8 +235,8 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
         if isinstance(it, dict) and it.get("id"):
             ids.append(str(it["id"]))
         elif isinstance(it, str):
-            ids.append(it)
-    _MODEL_LIST_CACHE[key] = (now, ids)
+            ids.append(str(it))
+    _MODEL_LIST_CACHE[key] = (now, list(ids))
     # Build and cache lowercase → canonical map
     lower_map: Dict[str, str] = {}
     for mid in ids:
@@ -218,7 +246,7 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
                 lower_map[norm] = mid
         except Exception:
             ...
-    _MODEL_CASE_MAP_CACHE[key] = (now, lower_map)
+    _MODEL_CASE_MAP_CACHE[key] = (now, dict(lower_map))
     # Persist to disk
     if settings.model_discovery_persist:
         try:
@@ -231,11 +259,13 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
                             obj = json.load(f) or {}
                     except Exception:
                         obj = {}
+                ts_wall_now = int(time.time())
                 obj[key] = {
                     "ids": ids,               # canonical ids as returned by provider
-                    "ids_lower": [i.lower() for i in ids],  # purely lowercased list for quick contains
+                    "ids_lower": [str(i).lower() for i in ids],  # purely lowercased list for quick contains
                     "lower_map": lower_map,    # lowercase → canonical
-                    "ts": int(now),
+                    "ts": ts_wall_now,
+                    "ts_wall": ts_wall_now,
                     "base_url": settings.chutes_base_url,
                 }
                 with open(settings.model_cache_file, "w", encoding="utf-8") as f:
@@ -247,13 +277,14 @@ async def _get_model_ids(headers: Dict[str, str]) -> Optional[List[str]]:
 
 async def _get_model_case_map(headers: Dict[str, str]) -> Optional[Dict[str, str]]:
     key = _models_cache_key(headers)
-    now = asyncio.get_event_loop().time()
+    now = time.monotonic()
     ttl = max(5, int(getattr(settings, "model_discovery_ttl", 300)))
     # in-memory
     if key in _MODEL_CASE_MAP_CACHE:
         ts, mp = _MODEL_CASE_MAP_CACHE[key]
         if now - ts < ttl:
             return mp
+    disk_map: Optional[Dict[str, str]] = None
     # disk
     if settings.model_discovery_persist and os.path.exists(settings.model_cache_file):
         try:
@@ -262,8 +293,22 @@ async def _get_model_case_map(headers: Dict[str, str]) -> Optional[Dict[str, str
             ent = obj.get(key)
             if isinstance(ent, dict) and isinstance(ent.get("lower_map"), dict):
                 mp = {str(k): str(v) for k, v in ent.get("lower_map").items()}
-                _MODEL_CASE_MAP_CACHE[key] = (now, mp)
-                return mp
+                ts_raw = ent.get("ts_wall")
+                if ts_raw is None:
+                    ts_raw = ent.get("ts")
+                ts_wall = 0.0
+                try:
+                    if isinstance(ts_raw, (int, float)):
+                        ts_wall = float(ts_raw)
+                    elif isinstance(ts_raw, str) and ts_raw:
+                        ts_wall = float(ts_raw)
+                except Exception:
+                    ts_wall = 0.0
+                wall_now = time.time()
+                if ts_wall > 1e9 and wall_now - ts_wall < ttl:
+                    _MODEL_CASE_MAP_CACHE[key] = (now, mp)
+                    return mp
+                disk_map = mp
         except Exception:
             ...
     # Build from ids if available
@@ -272,11 +317,17 @@ async def _get_model_case_map(headers: Dict[str, str]) -> Optional[Dict[str, str
         mp: Dict[str, str] = {}
         for mid in ids:
             try:
-                mp[mid.lower()] = mid
+                s = str(mid).strip()
+                if s:
+                    mp[s.lower()] = s
             except Exception:
                 ...
-        _MODEL_CASE_MAP_CACHE[key] = (now, mp)
-        return mp
+        if mp:
+            _MODEL_CASE_MAP_CACHE[key] = (now, mp)
+            return mp
+    if disk_map:
+        _MODEL_CASE_MAP_CACHE[key] = (now, disk_map)
+        return disk_map
     return None
 
 
@@ -2345,7 +2396,7 @@ async def get_models_cache(
 ):
     headers = _auth_headers(x_api_key, authorization)
     key = _models_cache_key(headers)
-    now = asyncio.get_event_loop().time()
+    now = time.time()
     # in-memory
     ent: Dict[str, Any] = {}
     if key in _MODEL_LIST_CACHE:
