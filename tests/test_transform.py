@@ -296,21 +296,41 @@ def test_deepseek_v31_prompt_formatting():
     
     # Test non-thinking mode prefix
     prefix = format_deepseek_v31_prompt("You are a helpful assistant.", "Hello, how are you?")
-    assert prefix == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Hello, how are you?<｜Assistant｜></tool_call>"
+    assert (
+        prefix
+        == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Hello, how are you?<｜Assistant｜></think>"
+    )
     
     # Test thinking mode prefix
-    thinking_prefix = format_deepseek_v31_prompt("You are a helpful assistant.", "Think step by step.", is_thinking=True)
-    assert thinking_prefix == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Think step by step.<｜Assistant｜><tool_call>"
+    thinking_prefix = format_deepseek_v31_prompt(
+        "You are a helpful assistant.", "Think step by step.", is_thinking=True
+    )
+    assert (
+        thinking_prefix
+        == "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>Think step by step.<｜Assistant｜><think>"
+    )
     
     # Test with context
-    context = "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What's the weather?<｜Assistant｜><tool_call>The weather is sunny.<｜end▁of▁sentence｜>"
-    with_context = format_deepseek_v31_prompt("You are a helpful assistant.", "What about tomorrow?", context=context)
-    assert with_context == context + "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What about tomorrow?<｜Assistant｜></tool_call>"
+    context = (
+        "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What's the weather?"
+        "<｜Assistant｜></think>The weather is sunny.<｜end▁of▁sentence｜>"
+    )
+    with_context = format_deepseek_v31_prompt(
+        "You are a helpful assistant.", "What about tomorrow?", context=context
+    )
+    assert (
+        with_context
+        == context
+        + "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>What about tomorrow?<｜Assistant｜></think>"
+    )
     
     # Test tool call prompt formatting
     tool_desc = "## Tools\nYou have access to the following tools:\n\n### get_weather\nDescription: Get weather information\nParameters: {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}"
     tool_prompt = format_deepseek_v31_tool_call_prompt("You are a helpful assistant.", tool_desc, "What's the weather in SF?")
-    expected = "<｜begin▁of▁sentence｜>You are a helpful assistant.\n\n" + tool_desc + "<｜User｜>What's the weather in SF?<｜Assistant｜></tool_call>"
+    expected = (
+        "<｜begin▁of▁sentence｜>You are a helpful assistant.\n\n" + tool_desc
+        + "<｜User｜>What's the weather in SF?<｜Assistant｜></think>"
+    )
     assert tool_prompt == expected
 
 
@@ -341,7 +361,7 @@ def test_deepseek_v31_tool_call_payload():
     assert "<｜begin▁of▁sentence｜>You are a helpful assistant." in result["prompt"]
     assert "## Tools" in result["tool_description"]
     assert "get_weather" in result["tool_description"]
-    assert "<｜User｜>What's the weather in SF?<｜Assistant｜></tool_call>" in result["prompt"]
+    assert "<｜User｜>What's the weather in SF?<｜Assistant｜></think>" in result["prompt"]
 
 
 def test_deepseek_v31_tool_call_parsing():

@@ -192,11 +192,13 @@ def anthropic_to_openai_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def format_deepseek_v31_tool_call_payload(system_prompt: str, tools: List[Dict[str, Any]], query: str) -> Dict[str, Any]:
+def format_deepseek_v31_tool_call_payload(
+    system_prompt: str, tools: List[Dict[str, Any]], query: str
+) -> Dict[str, Any]:
     """
     Format the payload for DeepSeek V3.1 tool calls according to the specified format.
-    
-    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>
+
+    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></think>
     """
     # Build tool description according to the format
     tool_description = "## Tools\nYou have access to the following tools:\n\n"
@@ -206,7 +208,10 @@ def format_deepseek_v31_tool_call_payload(system_prompt: str, tools: List[Dict[s
         tool_description += f"Parameters: {json_dumps_safe(tool.get('function', {}).get('parameters', {}))}\n\n"
     
     # Format the prompt according to DeepSeek V3.1 requirements
-    formatted_prompt = f"<｜begin▁of▁sentence｜>{system_prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>"
+    formatted_prompt = (
+        f"<｜begin▁of▁sentence｜>{system_prompt}\n\n"
+        f"{tool_description}<｜User｜>{query}<｜Assistant｜></think>"
+    )
     
     return {
         "prompt": formatted_prompt,
@@ -478,21 +483,27 @@ def format_longcat_prompt(
     return "\n\n".join(sections).strip()
 
 
-def format_deepseek_v31_prompt(system_prompt: str, user_query: str, context: str = "", is_thinking: bool = False) -> str:
+def format_deepseek_v31_prompt(
+    system_prompt: str, user_query: str, context: str = "", is_thinking: bool = False
+) -> str:
     """
     Format prompt according to DeepSeek V3.1 requirements.
-    
-    Non-thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></tool_call>
-    Non-thinking mode context: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></tool_call>{response}<｜end▁of▁sentence｜>...<｜User｜>{query}<｜Assistant｜></tool_call>{response}<｜end▁of▁sentence｜>
-    
-    Thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜><tool_call>
+
+    Non-thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></think>
+    Non-thinking mode context: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜></think>{response}<｜end▁of▁sentence｜>...
+
+    Thinking mode prefix: <｜begin▁of▁sentence｜>{system prompt}<｜User｜>{query}<｜Assistant｜><think>
     """
     if is_thinking:
-        # Thinking mode uses 🎤 token
-        prefix = f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜><tool_call>"
+        # Thinking mode uses <think> token
+        prefix = (
+            f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜><think>"
+        )
     else:
-        # Non-thinking mode uses 🎦 token
-        prefix = f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜></tool_call>"
+        # Non-thinking mode uses </think> closing token
+        prefix = (
+            f"<｜begin▁of▁sentence｜>{system_prompt}<｜User｜>{user_query}<｜Assistant｜></think>"
+        )
     
     if context:
         # Append context to prefix
@@ -503,10 +514,13 @@ def format_deepseek_v31_prompt(system_prompt: str, user_query: str, context: str
 def format_deepseek_v31_tool_call_prompt(system_prompt: str, tool_description: str, user_query: str) -> str:
     """
     Format tool call prompt according to DeepSeek V3.1 requirements.
-    
-    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></tool_call>
+
+    Toolcall format: <｜begin▁of▁sentence｜>{system prompt}\n\n{tool_description}<｜User｜>{query}<｜Assistant｜></think>
     """
-    return f"<｜begin▁of▁sentence｜>{system_prompt}\n\n{tool_description}<｜User｜>{user_query}<｜Assistant｜></tool_call>"
+    return (
+        f"<｜begin▁of▁sentence｜>{system_prompt}\n\n{tool_description}"
+        f"<｜User｜>{user_query}<｜Assistant｜></think>"
+    )
 
 
 
