@@ -71,7 +71,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8090
 <b>Run with Claude Code</b>
 
 ```
-ANTHROPIC_BASE_URL="http://localhost:8090" ANTHROPIC_API_KEY="your-chutes-api-key" ANTHROPIC_MODEL="moonshotai/Kimi-K2-Instruct-0905" ANTHROPIC_SMALL_FAST_MODEL="moonshotai/Kimi-K2-Instruct-0905" claude --dangerously-skip-permissions
+ANTHROPIC_BASE_URL="http://localhost:8090" ANTHROPIC_API_KEY="your-chutes-api-key" ANTHROPIC_MODEL="zai-org/GLM-4.5" ANTHROPIC_SMALL_FAST_MODEL="zai-org/GLM-4.5" CLAUDE_CODE_SUBAGENT_MODEL="zai-org/GLM-4.5" API_TIMEOUT_MS=1800000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude --dangerously-skip-permissions
 ```
 
 Usage (Anthropic-compatible)
