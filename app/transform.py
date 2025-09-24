@@ -526,62 +526,124 @@ def format_deepseek_v31_tool_call_prompt(system_prompt: str, tool_description: s
 
 def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]]:
     """Parse DeepSeek V3.1 tool-call markup into structured tool_use blocks.
-    
+
     Recognizes sections of the form:
       <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>tool_name<｜tool▁sep｜>{"key": "value"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
-    
+
     Returns (remaining_text_without_markup, tool_use_blocks)
     """
     if not text:
         return text, []
-    
-    # Normalize fullwidth characters and special glyphs
+
+    # Normalize fullwidth characters and special glyphs more comprehensively
     try:
         normalized_text = text.replace("｜", "|").replace("▁", "_")
     except Exception:
         normalized_text = text
-    
-    BEG = "<|tool_calls_begin|>"
-    END = "<|tool_calls_end|>"
-    CALL_BEG = "<|tool_call_begin|>"
-    CALL_END = "<|tool_call_end|>"
-    SEP = "<|tool_sep|>"
-    
+
+    # Handle different marker formats that DeepSeek might use
+    BEG_MARKERS = ["<|tool_calls_begin|>", "<|tool_calls_section_begin|>", "<|tool▁calls▁begin|>"]
+    END_MARKERS = ["<|tool_calls_end|>", "<|tool_calls_section_end|>", "<|tool▁calls▁end|>"]
+    CALL_BEG_MARKERS = ["<|tool_call_begin|>", "<|tool▁call▁begin|>"]
+    CALL_END_MARKERS = ["<|tool_call_end|>", "<|tool▁call▁end|>"]
+    SEP_MARKERS = ["<|tool_sep|>", "<|tool▁sep|>"]
+
     out_text_parts: list[str] = []
     calls: list[Dict[str, Any]] = []
     pos = 0
     n = len(normalized_text)
-    
+
     while pos < n:
-        i = normalized_text.find(BEG, pos)
-        if i == -1:
+        # Look for begin markers
+        begin_pos = -1
+        begin_marker = ""
+        end_marker = ""
+
+        for beg_marker in BEG_MARKERS:
+            i = normalized_text.find(beg_marker, pos)
+            if i != -1 and (begin_pos == -1 or i < begin_pos):
+                begin_pos = i
+                begin_marker = beg_marker
+                # Match corresponding end marker
+                if "section" in beg_marker:
+                    end_marker = "<|tool_calls_section_end|>" if "section" in beg_marker else "<|tool_calls_end|>"
+                else:
+                    end_marker = "<|tool_calls_end|>" if "section" not in beg_marker else "<|tool_calls_section_end|>"
+                # Try to find the specific end marker, fallback to alternatives
+                if end_marker not in END_MARKERS:
+                    for end_m in END_MARKERS:
+                        if normalized_text.find(end_m, i) != -1:
+                            end_marker = end_m
+                            break
+
+        if begin_pos == -1:
             out_text_parts.append(normalized_text[pos:])
             break
+
         # text before the section
-        out_text_parts.append(normalized_text[pos:i])
-        j = normalized_text.find(END, i)
-        if j == -1:
+        out_text_parts.append(normalized_text[pos:begin_pos])
+
+        # Find corresponding end marker
+        end_pos = -1
+        for end_m in END_MARKERS:
+            j = normalized_text.find(end_m, begin_pos)
+            if j != -1 and (end_pos == -1 or j < end_pos):
+                end_pos = j
+                end_marker = end_m
+
+        if end_pos == -1:
             # No closing tag; keep as plain text
-            out_text_parts.append(normalized_text[i:])
+            out_text_parts.append(normalized_text[begin_pos:])
             break
-        
-        section = normalized_text[i + len(BEG):j]
-        call_pos = 0
-        call_n = len(section)
-        
-        while call_pos < call_n:
-            call_i = section.find(CALL_BEG, call_pos)
-            if call_i == -1:
+
+        # Extract the section content
+        section_start = begin_pos + len(begin_marker)
+        section = normalized_text[section_start:end_pos]
+
+        # Parse tool calls within the section
+        section_pos = 0
+        section_len = len(section)
+
+        while section_pos < section_len:
+            # Look for call begin markers
+            call_begin_pos = -1
+            call_begin_marker = ""
+            for call_beg in CALL_BEG_MARKERS:
+                i = section.find(call_beg, section_pos)
+                if i != -1 and (call_begin_pos == -1 or i < call_begin_pos):
+                    call_begin_pos = i
+                    call_begin_marker = call_beg
+
+            if call_begin_pos == -1:
                 break
-            call_j = section.find(CALL_END, call_i)
-            if call_j == -1:
+
+            # Look for call end markers
+            call_end_pos = -1
+            call_end_marker = ""
+            for call_end in CALL_END_MARKERS:
+                j = section.find(call_end, call_begin_pos)
+                if j != -1 and (call_end_pos == -1 or j < call_end_pos):
+                    call_end_pos = j
+                    call_end_marker = call_end
+
+            if call_end_pos == -1:
                 break
-            
-            call_content = section[call_i + len(CALL_BEG):call_j]
-            sep_idx = call_content.find(SEP)
-            if sep_idx != -1:
-                name = call_content[:sep_idx].strip()
-                args_raw = call_content[sep_idx + len(SEP):].strip()
+
+            # Extract call content
+            call_content = section[call_begin_pos + len(call_begin_marker):call_end_pos]
+
+            # Look for separator
+            sep_pos = -1
+            sep_marker = ""
+            for sep in SEP_MARKERS:
+                k = call_content.find(sep)
+                if k != -1 and (sep_pos == -1 or k < sep_pos):
+                    sep_pos = k
+                    sep_marker = sep
+
+            if sep_pos != -1:
+                name = call_content[:sep_pos].strip()
+                args_raw = call_content[sep_pos + len(sep_marker):].strip()
                 try:
                     args = json_loads_safe(args_raw)
                 except Exception:
@@ -594,11 +656,13 @@ def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]
                         "input": args if isinstance(args, dict) else {},
                     }
                 )
-            call_pos = call_j + len(CALL_END)
-        
+
+            # Move to after the call end marker
+            section_pos = call_end_pos + len(call_end_marker)
+
         # Skip the whole section in output text
-        pos = j + len(END)
-    
+        pos = end_pos + len(end_marker)
+
     return "".join(out_text_parts), calls
 
 
@@ -792,6 +856,11 @@ def openai_to_anthropic_response(
                     "run_terminal_cmd": "Bash",
                     "glob_file_search": "Glob",
                     "todo_write": "TodoWrite",
+                    # DeepSeek specific tool names
+                    "todowrite": "TodoWrite",
+                    "readfile": "Read",
+                    "writefile": "Write",
+                    "editfile": "Edit",
                 }
                 out = synonyms.get(out) or synonyms.get(out.lower()) or out
                 if out in declared_tool_names:
