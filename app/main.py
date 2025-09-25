@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+from dataclasses import asdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import uuid
 
@@ -27,6 +28,7 @@ from .transform import (
     choose_tool_call_parser,
     parse_mcp_tool_markup,
 )
+from .auto_compact import AutoCompactError, ensure_context_within_limits
 
 
 app = FastAPI(title="Claude-to-Chutes Proxy")
@@ -509,8 +511,72 @@ async def messages(
         "final_enabled": False,
     }
 
+    reserve_tokens = parsed.max_tokens or settings.chutes_response_token_reserve
+    try:
+        reserve_tokens = max(
+            0,
+            min(int(reserve_tokens), settings.chutes_max_tokens - settings.chutes_min_context_tokens),
+        )
+    except Exception:
+        reserve_tokens = settings.chutes_response_token_reserve
+
+    headers0 = _auth_headers(x_api_key, authorization)
+    client = _get_httpx_client()
+
+    try:
+        compacted_messages, token_stats = await ensure_context_within_limits(
+            parsed.model,
+            parsed.system,
+            list(parsed.messages),
+            client=client,
+            headers=headers0,
+            context_window=settings.chutes_max_tokens,
+            reserve_tokens=reserve_tokens,
+            buffer_ratio=settings.chutes_token_buffer_ratio,
+            tail_reserve=settings.chutes_tail_reserve,
+            summary_model=settings.chutes_summary_model,
+            summary_max_tokens=settings.chutes_summary_max_tokens,
+            summary_keep_last=settings.chutes_summary_keep_last,
+            auto_condense_percent=settings.chutes_auto_condense_percent,
+        )
+    except AutoCompactError as exc:
+        _rec["phase"] = "autocompact_error"
+        _rec["error"] = str(exc)
+        _RECENT.append(_rec)
+        return JSONResponse(
+            status_code=400,
+            content=ErrorResponse(error={"type": "invalid_request_error", "message": str(exc)}).model_dump(),
+        )
+
+    parsed = parsed.model_copy(update={"messages": compacted_messages})
+    body = parsed.model_dump()
+    token_headers = {
+        "X-Proxy-Context-Tokens-Before": str(token_stats.before_tokens),
+        "X-Proxy-Context-Tokens-After": str(token_stats.after_tokens),
+        "X-Proxy-Context-Threshold": str(token_stats.threshold),
+        "X-Proxy-Context-Truncated": "1" if token_stats.truncated else "0",
+        "X-Proxy-Context-Summary": "1" if token_stats.summary_added else "0",
+        "X-Proxy-Context-Removed-Messages": str(token_stats.removed_messages),
+        "X-Proxy-Context-Reserve-Tokens": str(reserve_tokens),
+    }
+    rec_token = asdict(token_stats)
+    rec_token["reserve_tokens"] = reserve_tokens
+    _rec["token_monitor"] = rec_token
+    if settings.debug:
+        try:
+            print(
+                f"[proxy] context tokens before/after: {token_stats.before_tokens}/{token_stats.after_tokens} (limit {token_stats.threshold})",
+                file=sys.stderr,
+            )
+        except Exception:
+            ...
+    try:
+        request.state.token_stats = token_stats
+    except Exception:
+        ...
+
     # Build OpenAI payload for Chutes（OpenAI 侧仅使用 sglang 协议模型校验/构造）
-    oai_payload = anthropic_to_openai_payload(parsed.model_dump())
+    oai_payload = anthropic_to_openai_payload(body)
     _rec["oai_model"] = oai_payload.get("model")
     # Preserve original requested model casing for outward-facing responses
     display_model = parsed.model
@@ -574,9 +640,7 @@ async def messages(
                 pass
         # Record resolved model (for /_debug/last), without logging sensitive payloads
         _rec["resolved_model"] = oai_payload.get("model")
-        client = _get_httpx_client()
         try:
-            headers0 = _auth_headers(x_api_key, authorization)
             if thinking_enabled:
                 headers0["X-Enable-Thinking"] = "true"
             if settings.debug:
@@ -667,36 +731,46 @@ async def messages(
                                     )
                                 except Exception:
                                     ...
-                            resp2 = await client.post(chutes_url, json=retry_payload, headers=headers0)
+                            resp2 = await client.post(chutes_url, json=retry_payload, headers=headers_stream)
                         except Exception:
                             resp2 = None  # type: ignore
                         if resp2 is not None and resp2.status_code < 400:
                             data2 = resp2.json()
                             _rec["phase"] = "non_stream_ok_after_404_retry"
                             _RECENT.append(_rec)
-                            return JSONResponse(content=openai_to_anthropic_response(
-                                data2,
-                                requested_model=display_model,
-                                tools=retry_payload.get("tools"),
-                                tool_call_parser=choose_tool_call_parser(retry_payload.get("model")),
-                            ))
+                            return JSONResponse(
+                                content=openai_to_anthropic_response(
+                                    data2,
+                                    requested_model=display_model,
+                                    tools=retry_payload.get("tools"),
+                                    tool_call_parser=choose_tool_call_parser(retry_payload.get("model")),
+                                ),
+                                headers=token_headers,
+                            )
                 except Exception:
                     ...
 
             _rec.update({"phase": "non_stream_error", "upstream_status": resp.status_code, "message": message})
             _RECENT.append(_rec)
-            return JSONResponse(status_code=resp.status_code, content=_anthropic_error_for_status(resp.status_code, message))
+            return JSONResponse(
+                status_code=resp.status_code,
+                content=_anthropic_error_for_status(resp.status_code, message),
+                headers=token_headers,
+            )
 
         data = resp.json()
         _rec["phase"] = "non_stream_ok"
         _RECENT.append(_rec)
-        return JSONResponse(content=openai_to_anthropic_response(
-            data,
-            # Always echo original request model casing outward
-            requested_model=display_model,
-            tools=oai_payload.get("tools"),
-            tool_call_parser=choose_tool_call_parser(oai_payload.get("model")),
-        ))
+        return JSONResponse(
+            content=openai_to_anthropic_response(
+                data,
+                # Always echo original request model casing outward
+                requested_model=display_model,
+                tools=oai_payload.get("tools"),
+                tool_call_parser=choose_tool_call_parser(oai_payload.get("model")),
+            ),
+            headers=token_headers,
+        )
 
     # Streaming path
     async def event_stream(request: Request) -> AsyncIterator[bytes]:
@@ -728,13 +802,13 @@ async def messages(
 
         # Open connection to Chutes
         model_to_use = oai_payload.get("model")
-        headers0 = _auth_headers(x_api_key, authorization)
+        headers_stream = dict(headers0)
         if thinking_enabled:
-            headers0["X-Enable-Thinking"] = "true"
+            headers_stream["X-Enable-Thinking"] = "true"
         # Map to canonical casing via cached lowercase map (no network RTT)
         if model_to_use:
             try:
-                resolved_model = await _resolve_case_variant(model_to_use, headers0)
+                resolved_model = await _resolve_case_variant(model_to_use, headers_stream)
                 if resolved_model and resolved_model != model_to_use:
                     if settings.debug:
                         print(f"[proxy] stream: resolve model '{model_to_use}' -> '{resolved_model}' (cache)")
@@ -764,7 +838,7 @@ async def messages(
 
         def _open_stream(payload_model: str):
             # Log upstream URL + headers (redacted) for debugging
-            _headers_stream = {**headers0, "Accept": "text/event-stream"}
+            _headers_stream = {**headers_stream, "Accept": "text/event-stream"}
             if settings.debug:
                 try:
                     redacted = {
@@ -856,7 +930,7 @@ async def messages(
                         try:
                             retry_model = None
                             # 1) Try canonical case via resolver again (could be a stale cache) 
-                            retry_model = await _resolve_case_variant(stream_payload.get("model"), headers0) or None
+                            retry_model = await _resolve_case_variant(stream_payload.get("model"), headers_stream) or None
                             if not retry_model:
                                 # 2) Try suffix-only id without vendor prefix
                                 raw = str(stream_payload.get("model") or "")
@@ -2322,7 +2396,11 @@ async def messages(
             _RECENT.append(_rec)
             print(f"[proxy] Stream ended with exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
 
-    return StreamingResponse(event_stream(request), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(request),
+        media_type="text/event-stream",
+        headers=token_headers,
+    )
 
 
 @app.get("/")

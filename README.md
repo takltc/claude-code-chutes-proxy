@@ -14,6 +14,7 @@ Performance Notes (Important)
 - Uses a shared HTTP client with connection pooling and optional HTTP/2 to reduce handshake latency.
 - Model discovery (`/v1/models`) is persisted to disk by default so subsequent boots do not re-fetch.
 - Streaming function-call parsing is optional to reduce per-chunk CPU; see `ENABLE_STREAM_TOOL_PARSER` below.
+- Automatic context compaction keeps Anthropic histories within the configurable token budget and surfaces live token usage via response headers.
 
 Quickstart
 
@@ -96,7 +97,13 @@ Body example:
 - Images and multimodal: request-side user/system image blocks are translated to OpenAI `image_url` content entries (non-streaming). Assistant image outputs are not mapped back (rare in OpenAI response).
 - Streaming emits Anthropic-style SSE events for text deltas. Token usage is reported at end when available from backend.
 - If your Chutes backend already exposes OpenAI-compatible endpoints (e.g. vLLM/SGLang templates), you can point `CHUTES_BASE_URL` directly to that service.
- - Tool-call parsing: the proxy auto-selects an sglang parser per model family (LLaMA/Qwen/Mistral/DeepSeek/Kimi/GLM/GPT‑OSS). Models whose id contains `longcat` are parsed with the GPT‑OSS style detector, matching sglang’s approach.
+- Tool-call parsing: the proxy auto-selects an sglang parser per model family (LLaMA/Qwen/Mistral/DeepSeek/Kimi/GLM/GPT‑OSS). Models whose id contains `longcat` are parsed with the GPT‑OSS style detector, matching sglang’s approach.
+- Auto-compaction response headers broadcast:
+  - `X-Proxy-Context-Tokens-Before/After/Threshold`
+  - `X-Proxy-Context-Truncated` and `X-Proxy-Context-Summary`
+  - `X-Proxy-Context-Removed-Messages`
+  - `X-Proxy-Context-Reserve-Tokens`
+  Downstream clients can surface these metrics for live telemetry and alerting.
 
 DeepSeek :THINKING Suffix
 
@@ -165,6 +172,15 @@ All environment variables with their defaults and descriptions:
 | `MODEL_DISCOVERY_PERSIST` | `1` | Persist `/v1/models` results to disk for reuse across restarts |
 | `MODEL_CACHE_FILE` | `~/.claude-code-chutes-proxy/models_cache.json` | Path to models cache JSON file |
 | `ENABLE_STREAM_TOOL_PARSER` | `0` | Enable sglang tool-call parser on streaming text (turn on only if you need inline tool markup parsing) |
+| `CHUTES_MAX_TOKENS` | `128000` | Maximum conversation tokens allowed before compaction |
+| `CHUTES_RESPONSE_TOKEN_RESERVE` | `4096` | Token budget reserved for the model response when callers omit `max_tokens` |
+| `CHUTES_MIN_CONTEXT_TOKENS` | `4096` | Lower bound for retained conversation tokens after compaction |
+| `CHUTES_TOKEN_BUFFER_RATIO` | `0.85` | Fraction of the effective window to target before trimming |
+| `CHUTES_TAIL_RESERVE` | `6` | Trailing messages preserved verbatim to keep recent turns intact |
+| `CHUTES_SUMMARY_MODEL` | - | Optional model id used for conversation summarization (defaults to the request model) |
+| `CHUTES_SUMMARY_MAX_TOKENS` | `1024` | Max tokens allocated when generating a summary |
+| `CHUTES_SUMMARY_KEEP_LAST` | `4` | Number of most recent messages retained after summarization |
+| `CHUTES_AUTO_CONDENSE_PERCENT` | `100` | Context percentage threshold that triggers automatic summarization |
 
 Persistent Model Discovery
 

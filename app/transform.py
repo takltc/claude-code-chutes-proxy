@@ -1179,20 +1179,25 @@ def json_dumps_safe(obj: Any) -> str:
 def json_loads_safe(s: Any) -> Any:
     try:
         import json
+        if not isinstance(s, str):
+            return s
 
-        if isinstance(s, str):
-            return json.loads(s)
-        return s
+        candidates = [s]
+        try:
+            repaired = _repair_invalid_json_escapes(s)
+        except Exception:
+            repaired = s
+        if repaired != s:
+            candidates.append(repaired)
+
+        for candidate in candidates:
+            for strict_flag in (True, False):
+                try:
+                    return json.loads(candidate, strict=strict_flag)
+                except Exception:
+                    ...
+        return {}
     except Exception:
-        if isinstance(s, str):
-            try:
-                repaired = _repair_invalid_json_escapes(s)
-                if repaired != s:
-                    import json
-
-                    return json.loads(repaired)
-            except Exception:
-                ...
         return {}
 
 

@@ -46,10 +46,43 @@ class Settings:
             os.environ.get("MODEL_DISCOVERY_PERSIST", "1").lower() in ("1", "true", "yes")
         )
         # Path to models cache file (JSON). Default under home dir.
-        default_cache_path = os.path.join(os.path.expanduser("~"), 
-                                          ".claude-code-chutes-proxy", 
-                                          "models_cache.json")
+        default_cache_path = os.path.join(
+            os.path.expanduser("~"),
+            ".claude-code-chutes-proxy",
+            "models_cache.json",
+        )
         self.model_cache_file: str = os.environ.get("MODEL_CACHE_FILE", default_cache_path)
+        self.chutes_max_tokens: int = max(1, int(os.environ.get("CHUTES_MAX_TOKENS", "128000")))
+        # How much of the window to keep after compaction; defaults mirror Roo-Code heuristics
+        try:
+            self.chutes_token_buffer_ratio: float = float(os.environ.get("CHUTES_TOKEN_BUFFER_RATIO", str(0.85)))
+        except Exception:
+            self.chutes_token_buffer_ratio = 0.85
+        try:
+            self.chutes_tail_reserve: int = max(1, int(os.environ.get("CHUTES_TAIL_RESERVE", "6")))
+        except Exception:
+            self.chutes_tail_reserve = 6
+        try:
+            self.chutes_response_token_reserve: int = max(0, int(os.environ.get("CHUTES_RESPONSE_TOKEN_RESERVE", "4096")))
+        except Exception:
+            self.chutes_response_token_reserve = 4096
+        try:
+            self.chutes_min_context_tokens: int = max(512, int(os.environ.get("CHUTES_MIN_CONTEXT_TOKENS", "4096")))
+        except Exception:
+            self.chutes_min_context_tokens = 4096
+        self.chutes_summary_model: Optional[str] = os.environ.get("CHUTES_SUMMARY_MODEL")
+        try:
+            self.chutes_summary_max_tokens: int = max(256, int(os.environ.get("CHUTES_SUMMARY_MAX_TOKENS", "1024")))
+        except Exception:
+            self.chutes_summary_max_tokens = 1024
+        try:
+            self.chutes_summary_keep_last: int = max(1, int(os.environ.get("CHUTES_SUMMARY_KEEP_LAST", "4")))
+        except Exception:
+            self.chutes_summary_keep_last = 4
+        try:
+            self.chutes_auto_condense_percent: int = max(10, int(os.environ.get("CHUTES_AUTO_CONDENSE_PERCENT", "100")))
+        except Exception:
+            self.chutes_auto_condense_percent = 100
 
     def map_model(self, anthropic_model: str) -> str:
         return self.model_map.get(anthropic_model, anthropic_model)

@@ -367,7 +367,7 @@ def test_deepseek_v31_tool_call_payload():
 def test_deepseek_v31_tool_call_parsing():
     """Test DeepSeek V3.1 tool call markup parsing."""
     from app.transform import parse_deepseek_v31_tool_markup
-    
+
     # Test parsing DeepSeek V3.1 tool call markup
     text = "Some text <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"SF\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜> more text"
     remaining_text, tool_calls = parse_deepseek_v31_tool_markup(text)
@@ -396,6 +396,23 @@ def test_deepseek_v31_tool_call_parsing():
     
     assert remaining_text3 == text3
     assert len(tool_calls3) == 0
+
+
+def test_deepseek_tool_call_with_unescaped_newlines():
+    """DeepSeek tool markup should tolerate unescaped newlines in arguments."""
+    from app.transform import parse_deepseek_v31_tool_markup
+
+    text = (
+        '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>TodoWrite<｜tool▁sep｜>{"todos": [{"content": "测试", "status": "completed", "activeForm": "Analyzing \n'
+        '  project structure"}]}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+    )
+
+    _, calls = parse_deepseek_v31_tool_markup(text)
+
+    assert calls, "expected tool call to be parsed"
+    first = calls[0]["input"]["todos"][0]
+    assert "Analyzing" in first["activeForm"]
+    assert "project structure" in first["activeForm"]
 
 
 def test_deepseek_tool_call_preserves_declared_name():
