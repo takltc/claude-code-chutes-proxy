@@ -117,6 +117,42 @@ async def test_ensure_context_fallback_to_sliding_window_when_summary_fails():
 
 
 @pytest.mark.asyncio
+async def test_threshold_respects_safety_tokens():
+    long_text = "word " * 2200
+    messages = [
+        _msg("user", "intro"),
+        _msg("assistant", "ok"),
+        _msg("user", long_text),
+        _msg("assistant", "noted"),
+    ]
+
+    async def fake_summary(*_args, **_kwargs):
+        return "condensed", 64
+
+    compacted, stats = await ensure_context_within_limits(
+        model="claude-3-5-sonnet-20240620",
+        system="",
+        messages=messages,
+        client=None,
+        headers={},
+        context_window=2000,
+        reserve_tokens=0,
+        buffer_ratio=0.95,
+        tail_reserve=2,
+        summary_model=None,
+        summary_max_tokens=128,
+        summary_keep_last=1,
+        auto_condense_percent=50,
+        safety_tokens=400,
+        summary_provider=fake_summary,
+    )
+
+    assert stats.summary_added is True
+    assert stats.after_tokens <= stats.threshold
+    assert stats.threshold == 1600
+
+
+@pytest.mark.asyncio
 async def test_ensure_context_raises_when_unable_to_fit():
     gigantic = "A" * 8000
     messages = [

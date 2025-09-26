@@ -83,6 +83,10 @@ class Settings:
             self.chutes_auto_condense_percent: int = max(10, int(os.environ.get("CHUTES_AUTO_CONDENSE_PERCENT", "100")))
         except Exception:
             self.chutes_auto_condense_percent = 100
+        try:
+            self.chutes_context_safety_tokens: int = max(0, int(os.environ.get("CHUTES_CONTEXT_SAFETY_TOKENS", "2048")))
+        except Exception:
+            self.chutes_context_safety_tokens = 2048
 
     def map_model(self, anthropic_model: str) -> str:
         return self.model_map.get(anthropic_model, anthropic_model)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 import time
@@ -32,6 +33,14 @@ from .auto_compact import AutoCompactError, ensure_context_within_limits
 
 
 app = FastAPI(title="Claude-to-Chutes Proxy")
+
+logger = logging.getLogger("proxy")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+logger.propagate = False
+logger.setLevel(logging.DEBUG if settings.debug else logging.WARNING)
 
 # Shared HTTP client (HTTP/1.1 + optional HTTP/2) with connection pooling
 _HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
@@ -538,6 +547,7 @@ async def messages(
             summary_max_tokens=settings.chutes_summary_max_tokens,
             summary_keep_last=settings.chutes_summary_keep_last,
             auto_condense_percent=settings.chutes_auto_condense_percent,
+            safety_tokens=settings.chutes_context_safety_tokens,
         )
     except AutoCompactError as exc:
         _rec["phase"] = "autocompact_error"
@@ -562,14 +572,13 @@ async def messages(
     rec_token = asdict(token_stats)
     rec_token["reserve_tokens"] = reserve_tokens
     _rec["token_monitor"] = rec_token
-    if settings.debug:
-        try:
-            print(
-                f"[proxy] context tokens before/after: {token_stats.before_tokens}/{token_stats.after_tokens} (limit {token_stats.threshold})",
-                file=sys.stderr,
-            )
-        except Exception:
-            ...
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[proxy] context tokens before/after: %s/%s (limit %s)",
+            token_stats.before_tokens,
+            token_stats.after_tokens,
+            token_stats.threshold,
+        )
     try:
         request.state.token_stats = token_stats
     except Exception:
@@ -610,9 +619,9 @@ async def messages(
     think_trace["final_enabled"] = bool(thinking_enabled)
 
     # Optional verbose trace for thinking detection
-    if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+    if logger.isEnabledFor(logging.DEBUG) and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
         try:
-            print("[proxy] thinking-detect:", json.dumps(think_trace, ensure_ascii=False))
+            logger.debug("[proxy] thinking-detect: %s", json.dumps(think_trace, ensure_ascii=False))
         except Exception:
             ...
 
@@ -628,29 +637,35 @@ async def messages(
                 if not fixed:
                     fixed = _guess_case_for_known_models(oai_payload["model"])  # e.g., moonshotai/Kimi-K2-*
                 if fixed and fixed != oai_payload["model"]:
-                    if settings.debug:
-                        print(f"[proxy] non-stream: auto-fix model case '{oai_payload['model']}' -> '{fixed}'")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("[proxy] non-stream: auto-fix model case '%s' -> '%s'", oai_payload["model"], fixed)
                     oai_payload["model"] = fixed
             except Exception:
                 ...
-        if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+        if logger.isEnabledFor(logging.DEBUG) and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
             try:
-                print("[proxy] upstream payload (non-stream):", json.dumps({"url": chutes_url, **{k: v for k, v in oai_payload.items() if k != "messages"}, "model": oai_payload.get("model")}))
+                logger.debug(
+                    "[proxy] upstream payload (non-stream): %s",
+                    json.dumps(
+                        {"url": chutes_url, **{k: v for k, v in oai_payload.items() if k != "messages"}, "model": oai_payload.get("model")},
+                        ensure_ascii=False,
+                    ),
+                )
             except Exception:
-                pass
+                ...
         # Record resolved model (for /_debug/last), without logging sensitive payloads
         _rec["resolved_model"] = oai_payload.get("model")
         try:
             if thinking_enabled:
                 headers0["X-Enable-Thinking"] = "true"
-            if settings.debug:
+            if logger.isEnabledFor(logging.DEBUG):
                 try:
                     redacted = {
                         k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
                         for k, v in headers0.items()
                     }
-                    print(
-                        "[proxy] upstream request (non-stream):",
+                    logger.debug(
+                        "[proxy] upstream request (non-stream): %s",
                         json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
                     )
                 except Exception:
@@ -709,9 +724,13 @@ async def messages(
                     if not alt:
                         alt = _guess_case_for_known_models(original_model)
                     if alt and alt != original_model:
-                        if settings.debug:
+                        if logger.isEnabledFor(logging.DEBUG):
                             try:
-                                print(f"[proxy] non-stream: retry on 404 with case-fixed model '{original_model}' -> '{alt}'")
+                                logger.debug(
+                                    "[proxy] non-stream: retry on 404 with case-fixed model '%s' -> '%s'",
+                                    original_model,
+                                    alt,
+                                )
                             except Exception:
                                 ...
                         # Retry once with the corrected id
@@ -719,14 +738,14 @@ async def messages(
                         retry_payload["model"] = alt
                         _rec["resolved_model_retry"] = alt
                         try:
-                            if settings.debug:
+                            if logger.isEnabledFor(logging.DEBUG):
                                 try:
                                     redacted = {
                                         k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
                                         for k, v in headers0.items()
                                     }
-                                    print(
-                                        "[proxy] upstream request (non-stream, retry):",
+                                    logger.debug(
+                                        "[proxy] upstream request (non-stream, retry): %s",
                                         json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
                                     )
                                 except Exception:
@@ -810,8 +829,12 @@ async def messages(
             try:
                 resolved_model = await _resolve_case_variant(model_to_use, headers_stream)
                 if resolved_model and resolved_model != model_to_use:
-                    if settings.debug:
-                        print(f"[proxy] stream: resolve model '{model_to_use}' -> '{resolved_model}' (cache)")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[proxy] stream: resolve model '%s' -> '%s' (cache)",
+                            model_to_use,
+                            resolved_model,
+                        )
                     model_to_use = resolved_model
             except Exception:
                 ...
@@ -829,24 +852,30 @@ async def messages(
             except Exception:
                 ...
         _rec["resolved_model"] = model_to_use
-        if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+        if logger.isEnabledFor(logging.DEBUG) and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
             try:
-                print("[proxy] upstream payload (stream):", json.dumps({"url": chutes_url, **{k: v for k, v in stream_payload.items() if k != "messages"}, "model": model_to_use}))
+                logger.debug(
+                    "[proxy] upstream payload (stream): %s",
+                    json.dumps(
+                        {"url": chutes_url, **{k: v for k, v in stream_payload.items() if k != "messages"}, "model": model_to_use},
+                        ensure_ascii=False,
+                    ),
+                )
             except Exception:
-                pass
+                ...
         client = _get_httpx_client()
 
         def _open_stream(payload_model: str):
             # Log upstream URL + headers (redacted) for debugging
             _headers_stream = {**headers_stream, "Accept": "text/event-stream"}
-            if settings.debug:
+            if logger.isEnabledFor(logging.DEBUG):
                 try:
                     redacted = {
                         k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
                         for k, v in _headers_stream.items()
                     }
-                    print(
-                        "[proxy] upstream request (stream):",
+                    logger.debug(
+                        "[proxy] upstream request (stream): %s",
                         json.dumps({"url": chutes_url, "headers": redacted}, ensure_ascii=False),
                     )
                 except Exception:
@@ -861,9 +890,9 @@ async def messages(
 
         try:
             upstream_cm = _open_stream(model_to_use)
-            print(f"[proxy] Opening upstream stream with model: {model_to_use}", file=sys.stderr)
+            logger.debug("[proxy] Opening upstream stream with model: %s", model_to_use)
             async with upstream_cm as upstream:
-                print(f"[proxy] Upstream stream opened, status: {upstream.status_code}", file=sys.stderr)
+                logger.debug("[proxy] Upstream stream opened, status: %s", upstream.status_code)
                 _rec["phase"] = f"stream_status_{upstream.status_code}"
                 # Initialize message envelope state before handling error paths
                 sent_start = False
@@ -1139,7 +1168,7 @@ async def messages(
 
                 # Guard: if no chunks are received at all, emit an error event instead of silently ending
                 no_chunks = True
-                print("[proxy] Starting stream processing", file=sys.stderr)
+                logger.debug("[proxy] Starting stream processing")
                 # Anthropic stream scaffold
                 final_text: list[str] = []
 
@@ -1183,9 +1212,9 @@ async def messages(
                     known_tools: list[str] = [t.name for t in (parsed.tools or []) if getattr(t, "name", None)]
                 except Exception:
                     known_tools = []
-                if settings.debug and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
+                if logger.isEnabledFor(logging.DEBUG) and os.environ.get("DEBUG_PROXY_VERBOSE", "").lower() in ("1", "true", "yes"):
                     try:
-                        print("[proxy] declared tools:", json.dumps(known_tools, ensure_ascii=False))
+                        logger.debug("[proxy] declared tools: %s", json.dumps(known_tools, ensure_ascii=False))
                     except Exception:
                         ...
 
@@ -1412,7 +1441,7 @@ async def messages(
                 async for line in upstream.aiter_lines():
                         # Check if client has disconnected
                         if await request.is_disconnected():
-                            print("[proxy] Client disconnected during streaming", file=sys.stderr)
+                            logger.debug("[proxy] Client disconnected during streaming")
                             # Close any open blocks before ending
                             if text_block_index is not None:
                                 yield sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
@@ -1433,18 +1462,18 @@ async def messages(
                             yield sse("message_stop", {"type": "message_stop"})
                             _rec["phase"] = "stream_client_disconnected"
                             _RECENT.append(_rec)
-                            print("[proxy] Stream ended due to client disconnection", file=sys.stderr)
+                            logger.debug("[proxy] Stream ended due to client disconnection")
                             return
 
                         if not line:
-                            print("[proxy] Received empty line", file=sys.stderr)
+                            logger.debug("[proxy] Received empty line")
                             continue
                         if not line.startswith("data:"):
-                            print(f"[proxy] Received non-data line: {line[:100]}", file=sys.stderr)
+                            logger.debug("[proxy] Received non-data line: %s", line[:100])
                             continue
                         no_chunks = False
                         payload_str = line[5:].strip()
-                        print(f"[proxy] Received stream line: {payload_str[:100]}...", file=sys.stderr)
+                        logger.debug("[proxy] Received stream line: %s...", payload_str[:100])
                         if payload_str == "[DONE]":
                             # Close any open blocks
                             if text_block_index is not None:
@@ -1672,7 +1701,7 @@ async def messages(
                                                 continue
                                     except Exception as e:
                                         # Log the error for debugging but don't crash
-                                        print(f"[proxy] Error parsing simple calls: {e}", file=sys.stderr)
+                                        logger.warning("[proxy] Error parsing simple calls: %s", e)
                                         # Try alternative parsing for malformed tool calls
                                         try:
                                             # Handle case where tool calls might be malformed
@@ -1952,7 +1981,7 @@ async def messages(
                                                 continue
                                     except Exception as e:
                                         # Log the error for debugging but don't crash
-                                        print(f"[proxy] Error parsing simple calls: {e}", file=sys.stderr)
+                                        logger.warning("[proxy] Error parsing simple calls: %s", e)
                                         # Try alternative parsing for malformed tool calls
                                         try:
                                             # Handle case where tool calls might be malformed
@@ -2374,7 +2403,7 @@ async def messages(
                     yield sse("message_stop", {"type": "message_stop"})
                     _rec["phase"] = "stream_ok_eof"
                     _RECENT.append(_rec)
-                    print("[proxy] Stream ended normally", file=sys.stderr)
+                    logger.debug("[proxy] Stream ended normally")
         except Exception as e:
             # Surface upstream error as Anthropic error (single event) with graceful stop
             ms_fn = locals().get("ensure_message_start")
@@ -2383,9 +2412,7 @@ async def messages(
                 if msx:
                     yield msx
             # Log the exception for debugging purposes
-            print(f"[proxy] stream exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+            logger.exception("[proxy] stream exception: %s", e)
 
             data = {"type": "error", "error": {"type": "upstream_error", "message": str(e)}}
             yield f"event: error\n".encode() + f"data: {json.dumps(data)}\n\n".encode()
@@ -2394,7 +2421,7 @@ async def messages(
             _rec["message"] = str(e)
             _rec["exception_type"] = type(e).__name__
             _RECENT.append(_rec)
-            print(f"[proxy] Stream ended with exception: {type(e).__name__}: {str(e)}", file=sys.stderr)
+            logger.error("[proxy] Stream ended with exception: %s: %s", type(e).__name__, e)
 
     return StreamingResponse(
         event_stream(request),

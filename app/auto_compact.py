@@ -35,6 +35,8 @@ class ContextStats:
     summary_added: bool
     truncated: bool
     summary_tokens: int = 0
+    trigger_tokens: int = 0
+    safety_tokens: int = 0
 
 
 class TokenEstimator:
@@ -113,6 +115,7 @@ async def ensure_context_within_limits(
     summary_max_tokens: int,
     summary_keep_last: int,
     auto_condense_percent: int,
+    safety_tokens: int = 0,
     summary_provider: Optional[SummaryProvider] = None,
 ) -> Tuple[List[MessageInput], ContextStats]:
     if context_window <= 0:
@@ -126,9 +129,21 @@ async def ensure_context_within_limits(
     per_tokens = [estimator.count_message(m) for m in raw_messages]
     before_total = system_tokens + sum(per_tokens)
 
-    allowed_tokens = int(context_window * (1 - TOKEN_BUFFER_PERCENTAGE)) - reserve_tokens
-    allowed_tokens = max(512, allowed_tokens)
-    threshold_tokens = max(int(context_window * buffer_ratio) - reserve_tokens, allowed_tokens)
+    safety_tokens = max(0, safety_tokens)
+    capacity = context_window - reserve_tokens
+    capacity = max(512, capacity)
+    ratio_limit = int(context_window * buffer_ratio) - reserve_tokens
+    ratio_limit = max(512, ratio_limit)
+    percent_limit = int(context_window * (1 - TOKEN_BUFFER_PERCENTAGE)) - reserve_tokens
+    percent_limit = max(512, percent_limit)
+    # Condense when usage breaches either the configured percentage budget or the
+    # raw capacity after reserve tokens are carved out.
+    condense_trigger_tokens = min(capacity, percent_limit)
+    safety_limit = capacity
+    if safety_tokens:
+        safety_limit = max(512, capacity - safety_tokens)
+    # Take the most conservative limit across ratio, buffer, and explicit safety margins.
+    threshold_tokens = max(512, min(capacity, ratio_limit, percent_limit, safety_limit))
 
     if before_total <= threshold_tokens:
         return messages, ContextStats(
@@ -138,6 +153,8 @@ async def ensure_context_within_limits(
             removed_messages=0,
             summary_added=False,
             truncated=False,
+            trigger_tokens=condense_trigger_tokens,
+            safety_tokens=safety_tokens,
         )
 
     if summary_provider is None:
@@ -151,7 +168,7 @@ async def ensure_context_within_limits(
     summary_tokens = 0
     rebuilt: Optional[List[MessageInput]] = None
 
-    if context_percent >= auto_condense_percent or before_total > allowed_tokens:
+    if context_percent >= auto_condense_percent or before_total > condense_trigger_tokens:
         try:
             summary_text, summary_tokens = await summary_provider(
                 client,
@@ -192,6 +209,8 @@ async def ensure_context_within_limits(
                         summary_added=True,
                         truncated=False,
                         summary_tokens=summary_tokens,
+                        trigger_tokens=condense_trigger_tokens,
+                        safety_tokens=safety_tokens,
                     ),
                 )
 
@@ -214,6 +233,8 @@ async def ensure_context_within_limits(
                     summary_added=summary_added,
                     truncated=True,
                     summary_tokens=summary_tokens,
+                    trigger_tokens=condense_trigger_tokens,
+                    safety_tokens=safety_tokens,
                 ),
             )
 
