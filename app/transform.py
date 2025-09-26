@@ -547,6 +547,18 @@ def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]
     CALL_BEG_MARKERS = ["<|tool_call_begin|>", "<|tool▁call▁begin|>"]
     CALL_END_MARKERS = ["<|tool_call_end|>", "<|tool▁call▁end|>"]
     SEP_MARKERS = ["<|tool_sep|>", "<|tool▁sep|>"]
+    CALL_ARG_BEGIN_MARKERS = [
+        "<|tool_call_argument_begin|>",
+        "<|tool_call_arguments_begin|>",
+        "<|tool▁call▁argument▁begin|>",
+        "<|tool▁call▁arguments▁begin|>",
+    ]
+    CALL_ARG_END_MARKERS = [
+        "<|tool_call_argument_end|>",
+        "<|tool_call_arguments_end|>",
+        "<|tool▁call▁argument▁end|>",
+        "<|tool▁call▁arguments▁end|>",
+    ]
 
     out_text_parts: list[str] = []
     calls: list[Dict[str, Any]] = []
@@ -641,11 +653,38 @@ def parse_deepseek_v31_tool_markup(text: str) -> tuple[str, list[Dict[str, Any]]
                     sep_pos = k
                     sep_marker = sep
 
+            name = ""
+            args_raw = ""
             if sep_pos != -1:
                 name = call_content[:sep_pos].strip()
-                args_raw = call_content[sep_pos + len(sep_marker):].strip()
+                args_raw = call_content[sep_pos + len(sep_marker) :].strip()
+            else:
+                arg_begin_pos = -1
+                arg_begin_marker = ""
+                for arg_beg in CALL_ARG_BEGIN_MARKERS:
+                    k = call_content.find(arg_beg)
+                    if k != -1 and (arg_begin_pos == -1 or k < arg_begin_pos):
+                        arg_begin_pos = k
+                        arg_begin_marker = arg_beg
+
+                if arg_begin_pos != -1:
+                    name = call_content[:arg_begin_pos].strip()
+                    search_start = arg_begin_pos + len(arg_begin_marker)
+                    arg_end_pos = -1
+                    for arg_end in CALL_ARG_END_MARKERS:
+                        m = call_content.find(arg_end, search_start)
+                        if m != -1 and (arg_end_pos == -1 or m < arg_end_pos):
+                            arg_end_pos = m
+                    if arg_end_pos == -1:
+                        args_raw = call_content[search_start:].strip()
+                    else:
+                        args_raw = call_content[search_start:arg_end_pos].strip()
+                else:
+                    name = call_content.strip()
+
+            if name:
                 try:
-                    args = json_loads_safe(args_raw)
+                    args = json_loads_safe(args_raw) if args_raw else {}
                 except Exception:
                     args = {}
                 calls.append(
@@ -730,6 +769,21 @@ def openai_to_anthropic_response(
     thinking_blocks: List[Dict[str, Any]] = []
     model_name = str(requested_model or oai.get("model") or "")
     is_deepseek_model = "deepseek" in model_name.lower()
+
+    def _extract_orphan_thinking(block: Any) -> tuple[Optional[str], Optional[str]]:
+        closing_tag = "</think>"
+        if not isinstance(block, str):
+            return None, None
+        if "<think" in block or closing_tag not in block:
+            return None, None
+        idx = block.find(closing_tag)
+        if idx == -1:
+            return None, None
+        head = block[:idx]
+        if not head.strip():
+            return None, None
+        remainder = block[idx + len(closing_tag) :]
+        return head, remainder
 
     # Preserve declared tool names (if any) so we can map upstream aliases back to canonical casing
     declared_tool_names: list[str] = []
@@ -886,6 +940,10 @@ def openai_to_anthropic_response(
                 text = "".join(str(part.get("text", "")) for part in text if isinstance(part, dict))
             except Exception:
                 text = ""
+        orphan_reason, orphan_tail = _extract_orphan_thinking(text)
+        if orphan_reason is not None:
+            thinking_blocks.append({"type": "thinking", "thinking": orphan_reason})
+            text = orphan_tail or ""
         # If available, include reasoning content as a dedicated thinking block (for proper UI display)
         reasoning = message.get("reasoning_content")
         if reasoning:
@@ -1013,6 +1071,12 @@ def parse_stream_tools_text(
 
     cleaned_chunk, markup_calls = parse_longcat_tool_markup(text_chunk)
     cleaned_chunk = normalize_longcat_completion(cleaned_chunk, model_name)
+    cleaned_chunk, deepseek_calls = parse_deepseek_v31_tool_markup(cleaned_chunk)
+    if deepseek_calls:
+        if markup_calls:
+            markup_calls.extend(deepseek_calls)
+        else:
+            markup_calls = list(deepseek_calls)
     if not tools:
         return cleaned_chunk, markup_calls
     if markup_calls:

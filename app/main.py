@@ -27,6 +27,7 @@ from .transform import (
     map_finish_reason,
     openai_to_anthropic_response,
     choose_tool_call_parser,
+    parse_deepseek_v31_tool_markup,
     parse_mcp_tool_markup,
 )
 from .auto_compact import AutoCompactError, ensure_context_within_limits
@@ -941,6 +942,22 @@ async def messages(
                         )
                     return None
 
+                def _extract_orphan_thinking_from_content(content: Any) -> tuple[Optional[str], Optional[str]]:
+                    """Detect thinking text that arrived inside a plain text block without an opening <think>."""
+                    closing_tag = "</think>"
+                    if not content or not isinstance(content, str):
+                        return None, None
+                    if "<think" in content:
+                        return None, None
+                    idx = content.find(closing_tag)
+                    if idx == -1:
+                        return None, None
+                    head = content[:idx]
+                    if not head.strip():
+                        return None, None
+                    remainder = content[idx + len(closing_tag) :]
+                    return head, remainder
+
                 # If upstream returns an error status, emit an SSE error event and stop
                 if upstream.status_code >= 400:
                     try:
@@ -1516,6 +1533,15 @@ async def messages(
                         if choices:
                             delta = (choices[0].get("delta") or {})
 
+                            if not delta.get("reasoning_content"):
+                                orphan_think, orphan_remainder = _extract_orphan_thinking_from_content(delta.get("content"))
+                                if orphan_think is not None:
+                                    delta["reasoning_content"] = orphan_think
+                                    if orphan_remainder is None:
+                                        delta.pop("content", None)
+                                    else:
+                                        delta["content"] = orphan_remainder
+
                             # Handle reasoning/thinking stream first
                             # Support either OpenAI reasoning models (delta.reasoning_content)
                             # or upstream-transformed shape (delta.thinking.{content|signature})
@@ -1668,13 +1694,34 @@ async def messages(
                                 def _parse_simple_calls(section: str):
                                     import re as _re
                                     simple_calls: list[dict] = []
+
+                                    # First, leverage the shared DeepSeek parser for known markup variants
                                     try:
-                                        # Try multiple patterns to handle different character encodings
+                                        _, ds_calls = parse_deepseek_v31_tool_markup(section)
+                                        for call in ds_calls or []:
+                                            simple_calls.append(
+                                                {
+                                                    "type": "tool_use",
+                                                    "id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                                                    "name": call.get("name"),
+                                                    "input": call.get("input") or {},
+                                                }
+                                            )
+                                    except Exception:
+                                        ...
+
+                                    if simple_calls:
+                                        return simple_calls
+
+                                    try:
+                                        # Try multiple patterns to handle different character encodings and argument markers
                                         patterns = [
                                             r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>",
                                             r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)(?:<\|tool_call_end\|>|\s*$)",
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_call_argument_begin\|>(.*?)(?:<\|tool_call_argument_end\|>|<\|tool_call_end\|>|\s*$)",
                                             r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)<｜tool▁call▁end｜>",
-                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)"
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁argument▁begin｜>(.*?)(?:<｜tool▁call▁argument▁end｜>|<｜tool▁call▁end｜>|\s*$)"
                                         ]
 
                                         for pattern_str in patterns:
@@ -1732,7 +1779,7 @@ async def messages(
                                         s = text or ""
                                         # Remove all known tool markers
                                         s = _re.sub(r"<\|tool_(calls_)?(begin|end)\|>", "", s)
-                                        s = _re.sub(r"<\|tool_call_(begin|end)\|>", "", s)
+                                        s = _re.sub(r"<\|tool_call_(begin|end|argument_begin|argument_end|arguments_begin|arguments_end)\|>", "", s)
                                         s = _re.sub(r"<\|tool_sep\|>", "", s)
                                         # Drop whitespace/newlines
                                         s = s.strip()
@@ -1948,13 +1995,33 @@ async def messages(
                                 def _parse_simple_calls(section: str):
                                     import re as _re
                                     simple_calls: list[dict] = []
+
                                     try:
-                                        # Try multiple patterns to handle different character encodings
+                                        _, ds_calls = parse_deepseek_v31_tool_markup(section)
+                                        for call in ds_calls or []:
+                                            simple_calls.append(
+                                                {
+                                                    "type": "tool_use",
+                                                    "id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                                                    "name": call.get("name"),
+                                                    "input": call.get("input") or {},
+                                                }
+                                            )
+                                    except Exception:
+                                        ...
+
+                                    if simple_calls:
+                                        return simple_calls
+
+                                    try:
+                                        # Try multiple patterns to handle different character encodings and argument markers
                                         patterns = [
                                             r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)<\|tool_call_end\|>",
                                             r"<\|tool_call_begin\|>(.*?)<\|tool_sep\|>(.*?)(?:<\|tool_call_end\|>|\s*$)",
+                                            r"<\|tool_call_begin\|>(.*?)<\|tool_call_argument_begin\|>(.*?)(?:<\|tool_call_argument_end\|>|<\|tool_call_end\|>|\s*$)",
                                             r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)<｜tool▁call▁end｜>",
-                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)"
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)(?:<｜tool▁call▁end｜>|\s*$)",
+                                            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁call▁argument▁begin｜>(.*?)(?:<｜tool▁call▁argument▁end｜>|<｜tool▁call▁end｜>|\s*$)"
                                         ]
 
                                         for pattern_str in patterns:
@@ -1974,21 +2041,16 @@ async def messages(
                                                         "name": name,
                                                         "input": args if isinstance(args, dict) else {}
                                                     })
-                                                # If we found matches with this pattern, break
                                                 if simple_calls:
                                                     break
                                             except Exception:
                                                 continue
                                     except Exception as e:
-                                        # Log the error for debugging but don't crash
                                         logger.warning("[proxy] Error parsing simple calls: %s", e)
-                                        # Try alternative parsing for malformed tool calls
                                         try:
-                                            # Handle case where tool calls might be malformed
                                             tools = ["TodoWrite", "Read", "Write", "Edit", "Grep", "Glob", "Bash"]
                                             for tool_name in tools:
                                                 if tool_name in section:
-                                                    # Try to extract tool calls with a more permissive pattern
                                                     alt_pattern = _re.compile(rf"{tool_name}[^\{{]*(\{{.*?\}})")
                                                     for m in alt_pattern.finditer(section):
                                                         try:
